@@ -264,6 +264,8 @@ class ModelConfig:
     """Name or path of the Hugging Face model to use. It is also used as the
     content for `model_name` tag in metrics output when `served_model_name` is
     not specified."""
+    gguf_file: Optional[str] = None
+    """Name or relative path of the GGUF file to load when using GGUF weights."""
     runner: RunnerOption = "auto"
     """The type of model runner to use. Each vLLM instance only supports one
     model runner, even if the same model can be used for multiple types."""
@@ -473,6 +475,7 @@ class ModelConfig:
         """
         factors: list[Any] = []
         factors.append(self.model)
+        factors.append(self.gguf_file)
         factors.append(self.dtype)
         factors.append(self.quantization)
         factors.append(self.revision)
@@ -522,6 +525,13 @@ class ModelConfig:
                     "affect the random state of the Python process that "
                     "launched vLLM.", self.seed)
 
+        if self.gguf_file:
+            if self.quantization is not None and self.quantization != "gguf":
+                raise ValueError(
+                    "GGUF quantization was requested via the model spec, but "
+                    f"quantization is set to {self.quantization!r}.")
+            self.quantization = "gguf"
+
         # Keep set served_model_name before maybe_model_redirect(self.model)
         self.served_model_name = get_served_model_name(self.model,
                                                        self.served_model_name)
@@ -569,7 +579,8 @@ class ModelConfig:
                 model=self.model,
                 tokenizer=self.tokenizer,
                 revision=self.revision,
-                trust_remote_code=self.trust_remote_code)
+                trust_remote_code=self.trust_remote_code,
+                gguf_file=self.gguf_file)
 
         if (backend := envs.VLLM_ATTENTION_BACKEND
             ) and backend == "FLASHINFER" and find_spec("flashinfer") is None:
@@ -598,7 +609,8 @@ class ModelConfig:
                                self.code_revision,
                                self.config_format,
                                hf_overrides_kw=hf_overrides_kw,
-                               hf_overrides_fn=hf_overrides_fn)
+                               hf_overrides_fn=hf_overrides_fn,
+                               gguf_file=self.gguf_file)
 
         self.hf_config = hf_config
         self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -1581,6 +1593,7 @@ class ModelConfig:
                 self.hf_config_path or self.model,
                 trust_remote_code=self.trust_remote_code,
                 revision=self.revision,
+                gguf_file=self.gguf_file if self.hf_config_path is None else None,
             )
         else:
             config = try_get_generation_config(

@@ -42,7 +42,8 @@ from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_ray_initialized
 from vllm.reasoning import ReasoningParserManager
 from vllm.test_utils import MODEL_WEIGHTS_S3_BUCKET, MODELS_ON_S3
-from vllm.transformers_utils.config import get_model_path, is_interleaved
+from vllm.transformers_utils.config import (get_model_path, is_interleaved,
+                                           resolve_gguf_filename)
 from vllm.transformers_utils.utils import check_gguf_file
 from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
                         GiB_bytes, get_ip, is_in_ray_actor)
@@ -951,6 +952,41 @@ class EngineArgs:
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
+        gguf_filename: Optional[str] = None
+        original_model = self.model
+
+        if (split_spec := _split_gguf_model_spec(self.model)) is not None:
+            repo_id, quant_spec = split_spec
+            token = self.hf_token
+            if isinstance(token, str) and not token.strip():
+                token = None
+            try:
+                gguf_filename = resolve_gguf_filename(repo_id,
+                                                     quant_spec,
+                                                     revision=self.revision,
+                                                     token=token)
+            except ValueError as exc:
+                raise ValueError(
+                    "Failed to resolve GGUF quantization '"
+                    f"{quant_spec}' for model '{self.model}': {exc}") from exc
+
+            if self.load_format not in ("auto", "gguf"):
+                raise ValueError(
+                    "GGUF quantization selection requires load-format 'gguf'.")
+            self.load_format = "gguf"
+
+            if self.quantization is not None and self.quantization != "gguf":
+                raise ValueError(
+                    "GGUF quantization selection conflicts with the "
+                    f"explicit quantization {self.quantization!r}.")
+            self.quantization = "gguf"
+
+            if self.served_model_name is None:
+                self.served_model_name = original_model
+
+            self.model = repo_id
+            logger.info("Using GGUF file %s from %s", gguf_filename, repo_id)
+
         # gguf file needs a specific model loader and doesn't use hf_repo
         if check_gguf_file(self.model):
             self.quantization = self.load_format = "gguf"
@@ -988,6 +1024,7 @@ class EngineArgs:
 
         return ModelConfig(
             model=self.model,
+            gguf_file=gguf_filename,
             hf_config_path=self.hf_config_path,
             runner=self.runner,
             convert=self.convert,
@@ -1884,3 +1921,27 @@ def human_readable_int(value):
 
     # Regular plain number.
     return int(value)
+
+
+def _split_gguf_model_spec(model: str) -> Optional[tuple[str, str]]:
+    """Split a GGUF model spec of the form ``repo:quant``."""
+
+    if "://" in model:
+        return None
+
+    colon_index = model.rfind(":")
+    if colon_index <= 0:
+        return None
+
+    # Handle Windows drive letters (e.g., C:\\path).
+    if (colon_index == 1 and len(model) > 2 and model[0].isalpha()
+            and model[1] == ":" and model[2] in ("/", "\\")):
+        return None
+
+    repo_id = model[:colon_index]
+    quant_spec = model[colon_index + 1:]
+
+    if not repo_id or not quant_spec:
+        return None
+
+    return repo_id, quant_spec
