@@ -787,7 +787,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         # 2.2: Process the remaining part
         if prefix_caching_enabled:
             if num_prefills > 0:
-                # Handle mixed batches (decode + prefill) and prefill-only
+                # When there are prefill sequences (possibly mixed with decode
+                # sequences), we split the processing:
+                #   - Decode tokens -> fused_recurrent_gated_delta_rule
+                #     (efficient for single-token sequences)
+                #   - Prefill tokens -> chunk_gated_delta_rule
+                #     (efficient for long sequences)
+                # This avoids inflating the chunk count (NT) in the kernel
+                # grid with many single-token decode sequences that would each
+                # become a separate chunk.
                 assert state_indices_tensor_p is not None
                 assert block_idx_last_computed_token_p is not None
                 block_state_indices = state_indices_tensor_p.gather(
@@ -800,128 +808,173 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 assert g_non_spec is not None
                 assert beta_non_spec is not None
                 assert non_spec_query_start_loc is not None
-                cu_seqlens = non_spec_query_start_loc[: end_non_spec_prefill + 1]
-                assert num_decodes + num_prefills == len(cu_seqlens) - 1
 
-                # Build initial state for all sequences
-                initial_state = ssm_state.new_zeros(
-                    (num_decodes + num_prefills, *ssm_state.shape[1:])
-                )
+                num_decode_tokens = attn_metadata.num_decode_tokens
 
-                # For decode sequences (if any), copy their existing state
+                # -- 2.2a: Process DECODE tokens with fused_recurrent --
+                core_attn_out_decode = None
                 if num_decodes > 0:
                     assert ssm_state_indices_decode is not None
-                    valid_decode_positions = torch.nonzero(
-                        ssm_state_indices_decode >= 0, as_tuple=False
-                    ).squeeze(-1)
-                    if valid_decode_positions.numel() > 0:
-                        decode_state_indices = ssm_state_indices_decode.index_select(
-                            0, valid_decode_positions
-                        ).to(device=ssm_state.device, dtype=torch.long)
-                        decode_states = ssm_state.index_select(0, decode_state_indices)
-                        initial_state.index_copy_(
-                            0,
-                            valid_decode_positions,
-                            decode_states,
-                        )
+                    valid_src_decode_slots = ssm_state_indices_decode >= 0
+                    ssm_state_indices_decode_clamped = ssm_state_indices_decode.clamp(
+                        min=0
+                    )
+                    initial_state_decode = ssm_state.index_select(
+                        0,
+                        ssm_state_indices_decode_clamped.to(torch.long),
+                    )
+                    # Zero out invalid slots using multiplication instead
+                    # of boolean indexing (which triggers torch.nonzero sync)
+                    valid_src_mask = valid_src_decode_slots.view(
+                        -1, *([1] * (initial_state_decode.dim() - 1))
+                    )
+                    initial_state_decode = initial_state_decode * valid_src_mask.to(
+                        initial_state_decode.dtype
+                    )
 
-                # For prefill sequences, copy cached state from block indices
-                if block_state_indices.numel() > 0:
-                    valid_block_positions = torch.nonzero(
-                        block_state_indices >= 0, as_tuple=False
-                    ).squeeze(-1)
-                    if valid_block_positions.numel() > 0:
-                        ssm_state_initials = ssm_state.index_select(
-                            0,
-                            block_state_indices.index_select(
-                                0, valid_block_positions
-                            ).to(device=ssm_state.device, dtype=torch.long),
+                    core_attn_out_decode, last_state_decode = (
+                        fused_recurrent_gated_delta_rule(
+                            q=query_non_spec[:, :num_decode_tokens, :, :],
+                            k=key_non_spec[:, :num_decode_tokens, :, :],
+                            v=value_non_spec[:, :num_decode_tokens, :, :],
+                            g=g_non_spec[:, :num_decode_tokens, :],
+                            beta=beta_non_spec[:, :num_decode_tokens, :],
+                            initial_state=initial_state_decode,
+                            inplace_final_state=False,
+                            cu_seqlens=non_spec_query_start_loc[: num_decodes + 1],
+                            ssm_state_indices=None,
+                            use_qk_l2norm_in_kernel=True,
                         )
-                        prefill_positions_in_initial_state = (
-                            valid_block_positions + num_decodes
-                        )
-                        initial_state.index_copy_(
-                            0,
-                            prefill_positions_in_initial_state,
-                            ssm_state_initials,
-                        )
+                    )
 
-                    if has_initial_state is not None:
-                        req_has_initial_state = has_initial_state[
-                            start_non_spec_prefill:end_non_spec_prefill
-                        ]
-                        prefill_indices = torch.arange(
-                            num_decodes,
-                            num_decodes + num_prefills,
-                            device=initial_state.device,
-                        )
-                        initial_state[prefill_indices[~req_has_initial_state], ...] = 0
+                    # Save decode final states
+                    assert state_indices_decode is not None
+                    valid_decode_slots = state_indices_decode >= 0
+                    dest_slots_d = state_indices_decode.clamp(min=0).to(
+                        device=ssm_state.device, dtype=torch.long
+                    )
+                    valid_decode_slots_broadcast = valid_decode_slots.view(
+                        -1,
+                        *([1] * (last_state_decode.dim() - 1)),
+                    )
+                    prior_state = ssm_state.index_select(0, dest_slots_d).to(
+                        last_state_decode.dtype
+                    )
+                    last_state_decode = torch.where(
+                        valid_decode_slots_broadcast,
+                        last_state_decode,
+                        prior_state,
+                    )
+                    ssm_state.index_copy_(
+                        0,
+                        dest_slots_d,
+                        last_state_decode.to(ssm_state.dtype),
+                    )
+
+                # -- 2.2b: Process PREFILL tokens with chunk_gated_delta_rule --
+                # Build prefill-only cu_seqlens.
+                # IMPORTANT: For pure prefill (num_decodes==0), pass
+                # non_spec_query_start_loc directly to preserve Python object
+                # identity. The FLA kernels use a tensor_cache decorator that
+                # caches results of prepare_chunk_indices based on `is` identity
+                # of cu_seqlens. Slicing creates a new Python object that
+                # always misses the cache, causing ~35x redundant recomputation
+                # per forward pass (once per GDN layer instead of once total)
+                # and triggering excessive Triton kernel re-launches.
+                if num_decodes == 0:
+                    # Pure prefill: non_spec_query_start_loc already starts
+                    # at 0 and covers only prefill sequences. Pass the
+                    # ORIGINAL tensor (not a slice/view) to preserve the
+                    # exact Python object identity for tensor_cache.
+                    cu_seqlens_prefill = non_spec_query_start_loc
+                else:
+                    # Mixed batch: slice out prefill portion and rebase to 0.
+                    cu_seqlens_prefill = non_spec_query_start_loc[
+                        num_decodes : num_decodes + num_prefills + 1
+                    ]
+                    if cu_seqlens_prefill[0] != 0:
+                        cu_seqlens_prefill = cu_seqlens_prefill - cu_seqlens_prefill[0]
+
+                # Build initial state for prefill sequences only.
+                # Use clamp+index_select+multiply instead of nonzero+index_copy_
+                # to avoid GPU-CPU synchronization from torch.nonzero().
+                clamped_block_indices = block_state_indices.clamp(min=0).to(
+                    device=ssm_state.device, dtype=torch.long
+                )
+                initial_state_prefill = ssm_state.index_select(0, clamped_block_indices)
+                # Zero out entries where block_state_indices < 0
+                valid_block_mask = (block_state_indices >= 0).view(
+                    -1, *([1] * (initial_state_prefill.dim() - 1))
+                )
+                initial_state_prefill = initial_state_prefill * valid_block_mask.to(
+                    initial_state_prefill.dtype
+                )
+                # Also zero out entries where the request has no cached state
+                if has_initial_state is not None:
+                    req_has_initial_state = has_initial_state[
+                        start_non_spec_prefill:end_non_spec_prefill
+                    ]
+                    has_state_mask = req_has_initial_state.view(
+                        -1, *([1] * (initial_state_prefill.dim() - 1))
+                    )
+                    initial_state_prefill = initial_state_prefill * has_state_mask.to(
+                        initial_state_prefill.dtype
+                    )
 
                 (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
+                    core_attn_out_prefill,
+                    last_state_prefill,
                     chunk_state_history,
                 ) = chunk_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
+                    q=query_non_spec[:, num_decode_tokens:, :, :],
+                    k=key_non_spec[:, num_decode_tokens:, :, :],
+                    v=value_non_spec[:, num_decode_tokens:, :, :],
+                    g=g_non_spec[:, num_decode_tokens:, :],
+                    beta=beta_non_spec[:, num_decode_tokens:, :],
+                    initial_state=initial_state_prefill,
                     output_final_state=True,
-                    cu_seqlens=cu_seqlens,
+                    cu_seqlens=cu_seqlens_prefill,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
                     return_intermediate_states=True,
                 )
 
-                # Write the last recurrent state for prefill requests
+                # Save prefill final states using clamp+where instead
+                # of nonzero to avoid GPU-CPU synchronization.
                 assert state_indices_prefill is not None
-                valid_prefill_positions = torch.nonzero(
-                    state_indices_prefill >= 0, as_tuple=False
-                ).squeeze(-1)
-                if valid_prefill_positions.numel() > 0:
-                    dest_slots = state_indices_prefill.index_select(
-                        0, valid_prefill_positions
-                    ).to(device=ssm_state.device, dtype=torch.long)
-                    prefill_positions_in_last_state = (
-                        valid_prefill_positions + num_decodes
-                    )
-                    ssm_state.index_copy_(
-                        0,
-                        dest_slots,
-                        last_recurrent_state.index_select(
-                            0, prefill_positions_in_last_state
-                        ).to(ssm_state.dtype),
-                    )
+                valid_prefill_slots = state_indices_prefill >= 0
+                dest_slots_p = state_indices_prefill.clamp(min=0).to(
+                    device=ssm_state.device, dtype=torch.long
+                )
+                valid_prefill_slots_broadcast = valid_prefill_slots.view(
+                    -1, *([1] * (last_state_prefill.dim() - 1))
+                )
+                prior_state_p = ssm_state.index_select(0, dest_slots_p).to(
+                    last_state_prefill.dtype
+                )
+                last_state_to_save = torch.where(
+                    valid_prefill_slots_broadcast,
+                    last_state_prefill,
+                    prior_state_p,
+                )
+                ssm_state.index_copy_(
+                    0,
+                    dest_slots_p,
+                    last_state_to_save.to(ssm_state.dtype),
+                )
 
-                # Write the last recurrent state for decode requests (if any)
-                if num_decodes > 0:
-                    assert state_indices_decode is not None
-                    decode_states = last_recurrent_state[:num_decodes]
-                    valid_decode_slots = state_indices_decode >= 0
-                    dest_slots = state_indices_decode.clamp(min=0).to(
-                        device=ssm_state.device, dtype=torch.long
+                # -- 2.2c: Concatenate decode and prefill attention outputs --
+                if core_attn_out_decode is not None:
+                    core_attn_out_non_spec = torch.cat(
+                        [core_attn_out_decode, core_attn_out_prefill], dim=1
                     )
-                    valid_decode_slots_broadcast = valid_decode_slots.view(
-                        -1,
-                        *([1] * (last_recurrent_state.dim() - 1)),
-                    )
-                    prior_state = ssm_state.index_select(0, dest_slots).to(
-                        last_recurrent_state.dtype
-                    )
-                    decode_states = torch.where(
-                        valid_decode_slots_broadcast,
-                        decode_states,
-                        prior_state,
-                    )
-                    ssm_state.index_copy_(
-                        0,
-                        dest_slots,
-                        decode_states.to(ssm_state.dtype),
-                    )
+                else:
+                    core_attn_out_non_spec = core_attn_out_prefill
 
-                # Write intermediate states (one per block) to the ssm state
+                # Write intermediate chunk states (one per block) to ssm_state.
+                # Since only prefill sequences are passed to
+                # chunk_gated_delta_rule, chunk_state_history contains only
+                # prefill chunks (no decode chunks to skip).
                 assert chunk_state_history is not None
                 assert chunk_state_history.numel() > 0
                 assert block_idx_first_scheduled_token_p is not None
@@ -933,27 +986,21 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 assert block_size is not None
 
                 chunk_history = chunk_state_history.to(ssm_state.dtype)
-                total_chunks = chunk_history.shape[0]
                 last_chunk_indices = attn_metadata.last_chunk_indices_p
-                prefill_chunk_count = (
-                    int(last_chunk_indices[-1].item()) + 1
-                    if (
-                        last_chunk_indices is not None
-                        and last_chunk_indices.numel() > 0
-                    )
-                    else 0
-                )
-                decode_chunk_count = max(total_chunks - prefill_chunk_count, 0)
-                chunk_history_prefill = chunk_history[decode_chunk_count:]
-                if chunk_history_prefill.shape[0] > 0:
+                if chunk_history.shape[0] > 0:
                     chunks_per_block = block_size // chunk_size
+
+                    # Batch all GPU->CPU transfers upfront with .tolist()
+                    # instead of per-iteration .item() calls, reducing
+                    # GPU-CPU synchronizations from ~4*num_prefills to 4.
+                    block_firsts = block_idx_first_scheduled_token_p.tolist()
+                    block_lasts = block_idx_last_scheduled_token_p.tolist()
+                    last_chunk_indices_list = last_chunk_indices.tolist()
+                    num_computed_tokens_list = num_computed_tokens_p.tolist()
+
                     for seq_idx in range(num_prefills):
-                        block_first = int(
-                            block_idx_first_scheduled_token_p[seq_idx].item()
-                        )
-                        block_last = int(
-                            block_idx_last_scheduled_token_p[seq_idx].item()
-                        )
+                        block_first = block_firsts[seq_idx]
+                        block_last = block_lasts[seq_idx]
                         n_blocks_to_fill = block_last - block_first
                         if n_blocks_to_fill <= 0:
                             continue
@@ -965,18 +1012,18 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                         first_chunk = (
                             0
                             if seq_idx == 0
-                            else int(last_chunk_indices[seq_idx - 1].item()) + 1
+                            else last_chunk_indices_list[seq_idx - 1] + 1
                         )
                         first_aligned_chunk = first_chunk + chunks_per_block - 1
-                        num_unaligned_tokens = int(
-                            num_computed_tokens_p[seq_idx].item() % block_size
+                        num_unaligned_tokens = (
+                            num_computed_tokens_list[seq_idx] % block_size
                         )
                         if num_unaligned_tokens > 0:
                             first_aligned_chunk -= num_unaligned_tokens // chunk_size
                         chunk_stop = (
                             first_aligned_chunk + n_blocks_to_fill * chunks_per_block
                         )
-                        cached_states = chunk_history_prefill[
+                        cached_states = chunk_history[
                             first_aligned_chunk:chunk_stop:chunks_per_block
                         ]
                         ssm_state[cache_blocks] = cached_states
@@ -991,7 +1038,14 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                     0,
                     ssm_state_indices_decode_clamped.to(torch.long),
                 )
-                initial_state_decode[~valid_src_decode_slots] = 0
+                # Zero out invalid slots using multiplication instead
+                # of boolean indexing (which triggers torch.nonzero sync)
+                valid_src_mask = valid_src_decode_slots.view(
+                    -1, *([1] * (initial_state_decode.dim() - 1))
+                )
+                initial_state_decode = initial_state_decode * valid_src_mask.to(
+                    initial_state_decode.dtype
+                )
 
                 core_attn_out_non_spec, last_recurrent_state = (
                     fused_recurrent_gated_delta_rule(
