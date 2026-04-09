@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import regex as re
 import torch
 import zmq
 
@@ -247,6 +248,55 @@ class MoRIIOConstants:
     VLLM_MORI_READ_ABORT_REQUEST_TIMEOUT = 3600
 
 
+# The router embeds both zmq_addresses in the request_id (similar to P2pNcclConnector):
+#   "___prefill_addr_{zmq}___decode_addr_{zmq}_{32-hex-uuid}"
+# MoRIIO zmq_address format: "host:IP,handshake:PORT,notify:PORT"
+#
+# This lets each connector side parse the peer's connection info without
+# requiring the router to pass it explicitly in kv_transfer_params.
+_PREFILL_ZMQ_RE = re.compile(r"___prefill_addr_(.+?)___decode_addr_")
+_DECODE_ZMQ_RE = re.compile(r"___decode_addr_(.+)_[0-9a-f]{32}$")
+
+
+def parse_moriio_zmq_address(
+    zmq_address: str,
+) -> tuple[str, int, int]:
+    """Parse the MoRI-IO zmq address into its components.
+
+    Parses ``"host:IP,handshake:PORT,notify:PORT"`` into
+        (host, handshake_port, notify_port).
+
+    Each key-value pair is split on the *first* colon so that IPv6 addresses
+    (e.g. ``host:::1``) are handled correctly.  Missing keys fall back to the
+    MoRIIO defaults.
+    """
+    parts: dict[str, str] = {}
+    for segment in zmq_address.split(","):
+        key, _, val = segment.partition(":")
+        parts[key.strip()] = val.strip()
+    host = parts.get("host", "")
+    handshake_port = int(parts.get("handshake", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT))
+    notify_port = int(parts.get("notify", MoRIIOConstants.DEFAULT_NOTIFY_PORT))
+    return host, handshake_port, notify_port
+
+
+def get_peer_zmq_from_request_id(request_id: str, is_producer: bool) -> str:
+    """Extract the *peer's* zmq_address from the vLLM router request_id.
+
+    The producer (prefill) needs the decode's address; the consumer (decode)
+    needs the prefill's address.
+    """
+    if is_producer:
+        m = _DECODE_ZMQ_RE.search(request_id)
+    else:
+        m = _PREFILL_ZMQ_RE.search(request_id)
+    if m is None:
+        raise ValueError(
+            f"Cannot parse peer zmq_address from request_id: {request_id!r}"
+        )
+    return m.group(1)
+
+
 @dataclass
 class ReqMeta:
     """Metadata for a single request."""
@@ -286,21 +336,23 @@ class MoRIIOConnectorMetadata(KVConnectorMetadata):
         write_mode=False,
     ):
         transfer_id = kv_transfer_params["transfer_id"]
+
+        # Parse host/ports from the request_id. The router embeds both zmq_addresses
+        # in the request_id
+        peer_zmq = get_peer_zmq_from_request_id(request_id, is_producer=write_mode)
+        remote_host, remote_handshake_port, remote_notify_port = (
+            parse_moriio_zmq_address(peer_zmq)
+        )
+
         _req = ReqMeta(
             transfer_id=transfer_id,
             local_block_ids=local_block_ids,
             remote_block_ids=kv_transfer_params["remote_block_ids"],
             remote_engine_id=kv_transfer_params["remote_engine_id"],
-            remote_host=kv_transfer_params["remote_host"],
-            remote_port=kv_transfer_params["remote_port"],
-            remote_handshake_port=kv_transfer_params.get(
-                "remote_handshake_port",
-                int(MoRIIOConstants.DEFAULT_HANDSHAKE_PORT)
-            ),
-            remote_notify_port=kv_transfer_params.get(
-                "remote_notify_port",
-                int(MoRIIOConstants.DEFAULT_NOTIFY_PORT)
-            ),
+            remote_host=remote_host,
+            remote_port=remote_handshake_port,
+            remote_handshake_port=remote_handshake_port,
+            remote_notify_port=remote_notify_port,
             tp_size=kv_transfer_params.get("tp_size", 1),
             remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
         )
