@@ -255,7 +255,9 @@ class MoRIIOConstants:
 # This lets each connector side parse the peer's connection info without
 # requiring the router to pass it explicitly in kv_transfer_params.
 _PREFILL_ZMQ_RE = re.compile(r"___prefill_addr_(.+?)___decode_addr_")
-_DECODE_ZMQ_RE = re.compile(r"___decode_addr_(.+)_[0-9a-f]{32}$")
+# vLLM wraps the router's X-Request-Id as "cmpl-<id>-<seq>-<hex>" so there may
+# be a trailing "-<seq>-<hex>" suffix after the 32-char UUID.  Allow it.
+_DECODE_ZMQ_RE = re.compile(r"___decode_addr_(.+)_[0-9a-f]{32}(?:-.*)?$")
 
 
 def parse_moriio_zmq_address(
