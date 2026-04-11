@@ -114,6 +114,11 @@ def _listen_for_register(hostname, port):
                             "Prefill" if role == "P" else "Decode",
                             instance,
                         )
+            else:
+                logger.warning(
+                    "Received message with unrecognized type %r; ignoring",
+                    data.get("type"),
+                )
 
 
 def start_service_discovery(hostname, port):
