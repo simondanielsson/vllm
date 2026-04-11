@@ -92,13 +92,27 @@ def _listen_for_register(hostname, port):
                             data["http_address"],
                         )
                         continue
-                    if data["http_address"] not in [
-                        i.get("http_address") for i in target_list
-                    ]:
+                    existing_idx = next(
+                        (
+                            idx
+                            for idx, i in enumerate(target_list)
+                            if i.get("http_address") == data["http_address"]
+                        ),
+                        None,
+                    )
+                    if existing_idx is not None:
+                        target_list[existing_idx] = instance
+                        logger.info(
+                            "Updated existing %s instance: %s",
+                            "Prefill" if role == "P" else "Decode",
+                            instance,
+                        )
+                    else:
                         target_list.append(instance)
-                        print(
-                            f"Registered {'Prefill' if role == 'P' else 'Decode'}: "
-                            f"{instance}"
+                        logger.info(
+                            "Registered %s instance: %s",
+                            "Prefill" if role == "P" else "Decode",
+                            instance,
                         )
 
 
