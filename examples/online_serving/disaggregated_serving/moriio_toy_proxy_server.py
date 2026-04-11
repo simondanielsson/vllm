@@ -271,6 +271,7 @@ async def handle_request():
             "do_remote_prefill": True,
             "remote_engine_id": None,
             "remote_block_ids": None,
+            "transfer_id": transfer_id,
         }
         if TRANSFER_TYPE == "READ":
             # In read mode, prefill and decode are executed serially.
