@@ -49,6 +49,20 @@ def _listen_for_register(hostname, port):
                 pass
             elif data.get("type") in ("P", "D"):
                 role = data["type"]
+                required_keys = {
+                    "http_address",
+                    "zmq_address",
+                    "dp_size",
+                    "tp_size",
+                    "transfer_mode",
+                }
+                missing = required_keys - data.keys()
+                if missing:
+                    logger.error(
+                        "Registration message missing required keys %s; skipping",
+                        missing,
+                    )
+                    continue
                 # Derive request_address from http_address
                 instance = {
                     "role": role,
@@ -70,10 +84,14 @@ def _listen_for_register(hostname, port):
                         TRANSFER_TYPE = transfer_mode
                         logger.info("SET TRANSFER TYPE TO %s", TRANSFER_TYPE)
                     elif transfer_mode != TRANSFER_TYPE:
-                        raise ValueError(
-                            f"mismatched transfer mode {TRANSFER_TYPE}"
-                            f" vs {transfer_mode}"
+                        logger.error(
+                            "Mismatched transfer mode: expected %s, got %s;"
+                            " skipping registration of %s",
+                            TRANSFER_TYPE,
+                            transfer_mode,
+                            data["http_address"],
                         )
+                        continue
                     if data["http_address"] not in [
                         i.get("http_address") for i in target_list
                     ]:
