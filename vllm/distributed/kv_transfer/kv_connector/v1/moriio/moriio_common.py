@@ -269,16 +269,23 @@ def parse_moriio_zmq_address(
         (host, handshake_port, notify_port).
 
     Each key-value pair is split on the *first* colon so that IPv6 addresses
-    (e.g. ``host:::1``) are handled correctly.  Missing keys fall back to the
-    MoRIIO defaults.
+    (e.g. ``host:::1``) are handled correctly.  Raises ``ValueError`` if any
+    of ``host``, ``handshake``, or ``notify`` keys are absent or if the port
+    values are non-numeric.
     """
     parts: dict[str, str] = {}
     for segment in zmq_address.split(","):
         key, _, val = segment.partition(":")
         parts[key.strip()] = val.strip()
-    host = parts.get("host", "")
-    handshake_port = int(parts.get("handshake", MoRIIOConstants.DEFAULT_HANDSHAKE_PORT))
-    notify_port = int(parts.get("notify", MoRIIOConstants.DEFAULT_NOTIFY_PORT))
+    try:
+        host = parts["host"]
+        handshake_port = int(parts["handshake"])
+        notify_port = int(parts["notify"])
+    except (KeyError, ValueError) as e:
+        raise ValueError(
+            f"Malformed zmq_address {zmq_address!r}: expected "
+            f"'host:IP,handshake:PORT,notify:PORT' format"
+        ) from e
     return host, handshake_port, notify_port
 
 
