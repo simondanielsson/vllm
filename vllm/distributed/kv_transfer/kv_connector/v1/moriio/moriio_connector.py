@@ -1313,13 +1313,21 @@ class MoRIIOConnectorWorker:
                         continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
-        # Drain any requests whose background handshakes just completed.
-        # Requests whose handshakes are still in progress will be retried
-        # on the next scheduler step when save_kv_layer is called again.
-        while not self._ready_requests.empty():
-            req_id, meta = self._ready_requests.get_nowait()
-            if meta.remote_engine_id in self.write_ready_flags:
-                self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
+        while True:
+            if (
+                self._ready_requests.empty()
+                and remote_engine_id not in self.write_ready_flags
+            ):
+                continue
+            elif not self._ready_requests.empty() and (
+                remote_engine_id in self.write_ready_flags
+            ):
+                self._write_blocks_for_req(
+                    *self._ready_requests.get_nowait(), layer_name, kv_layer
+                )
+                break
+            else:
+                break
 
     def get_engine_name_with_dp(self, engine_name, dp_rank):
         return f"{engine_name}_dp{dp_rank}"
@@ -1336,6 +1344,7 @@ class MoRIIOConnectorWorker:
         if self.mode == MoRIIOMode.WRITE:
             return
 
+        wait_handshake_readd_req = False
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_recv.items():
@@ -1351,19 +1360,29 @@ class MoRIIOConnectorWorker:
                         self._background_moriio_handshake(
                             req_id, remote_engine_id, meta
                         )
+                        wait_handshake_readd_req = True
+
                         continue
 
             # Handshake already completed, start async read xfer.
             self._read_blocks_for_req(req_id, meta)
         # Start transfers for requests whose handshakes have now finished.
 
-        # Drain any requests whose background handshakes just completed.
-        # Requests whose handshakes are still in progress will be retried
-        # on the next scheduler step when start_load_kv is called again.
-        while not self._ready_requests.empty():
-            req_id, meta = self._ready_requests.get_nowait()
-            if meta.remote_engine_id in self.load_ready_flag:
-                self._read_blocks_for_req(req_id, meta)
+        while True:
+            if (
+                self._ready_requests.empty()
+                and remote_engine_id not in self.load_ready_flag
+                and wait_handshake_readd_req
+            ):
+                continue
+            elif (
+                not self._ready_requests.empty()
+                and remote_engine_id in self.load_ready_flag
+            ):
+                self._read_blocks_for_req(*self._ready_requests.get_nowait())
+                break
+            else:
+                break
 
         self._reqs_to_send.update(metadata.reqs_to_send)
 
