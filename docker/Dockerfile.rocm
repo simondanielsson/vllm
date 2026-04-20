@@ -457,7 +457,7 @@ RUN install -m 0755 -d /etc/apt/keyrings \
          ibverbs-providers \
          ibverbs-utils \
          bnxt-rocelib=235.2.86.0 \
-    && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/ \
+    && cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/ \
     && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 
