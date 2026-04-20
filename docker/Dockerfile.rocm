@@ -453,9 +453,6 @@ RUN install -m 0755 -d /etc/apt/keyrings \
          > /etc/apt/sources.list.d/broadcom-nic.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-         librdmacm1 \
-         ibverbs-providers \
-         ibverbs-utils \
          bnxt-rocelib=235.2.86.0 \
     && cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/ \
     && ldconfig \
