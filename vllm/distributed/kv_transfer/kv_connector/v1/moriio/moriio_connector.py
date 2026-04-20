@@ -735,7 +735,8 @@ class MoRIIOConnectorWorker:
         self.dst_num_blocks: dict[EngineId, int] = {}
         # In progress transfers.
         self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
-        self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str]] = {}
+        # Values are (remote_host, remote_notify_port, transfer_id).
+        self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -1249,12 +1250,8 @@ class MoRIIOConnectorWorker:
                 last = status_list[-1]
                 if last.Succeeded():
                     done_req_ids.add(req_id)
-                    transfer_id = self.request_id_to_transfer_id.get(req_id, req_id)
-                    self.moriio_wrapper.send_notify(
-                        transfer_id,
-                        self._recving_transfers_callback_addr[req_id][0],
-                        self._recving_transfers_callback_addr[req_id][1],
-                    )
+                    host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    self.moriio_wrapper.send_notify(xfer_id, host, port)
                     to_remove.append(req_id)
                 elif last.Failed():
                     logger.error(
@@ -1265,13 +1262,9 @@ class MoRIIOConnectorWorker:
                         last.Message(),
                         last.Code(),
                     )
-                    transfer_id = self.request_id_to_transfer_id.get(req_id, req_id)
+                    host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
-                        self.moriio_wrapper.send_notify(
-                            transfer_id,
-                            self._recving_transfers_callback_addr[req_id][0],
-                            self._recving_transfers_callback_addr[req_id][1],
-                        )
+                        self.moriio_wrapper.send_notify(xfer_id, host, port)
                     except Exception:
                         logger.exception(
                             "Failed to send error notification for request %s",
@@ -1383,6 +1376,7 @@ class MoRIIOConnectorWorker:
         )
         self._read_blocks(
             request_id=req_id,
+            transfer_id=meta.transfer_id,
             dst_engine_id=meta.remote_engine_id,
             local_block_ids=meta.local_block_ids,
             remote_block_ids=meta.remote_block_ids,
@@ -1540,6 +1534,7 @@ class MoRIIOConnectorWorker:
         remote_block_ids: list[int],
         dst_engine_id: str,
         request_id: str,
+        transfer_id: str,
         remote_host: str,
         remote_notify_port: int,
     ) -> None:
@@ -1567,4 +1562,5 @@ class MoRIIOConnectorWorker:
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
                     str(remote_notify_port + self.tp_rank),
+                    transfer_id,
                 )
