@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import zmq
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -1319,11 +1320,22 @@ class MoRIIOConnectorWorker:
                         continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
+        if remote_engine_id is None:
+            return
+        _deadline = time.monotonic() + envs.VLLM_MORIIO_TRANSFER_TIMEOUT
         while True:
             if (
                 self._ready_requests.empty()
                 and remote_engine_id not in self.write_ready_flags
             ):
+                if time.monotonic() > _deadline:
+                    logger.warning(
+                        "Timed out waiting for write_ready_flags[%s]; "
+                        "adjust with VLLM_MORIIO_TRANSFER_TIMEOUT",
+                        remote_engine_id,
+                    )
+                    break
+                time.sleep(0.001)
                 continue
             elif not self._ready_requests.empty() and (
                 remote_engine_id in self.write_ready_flags
@@ -1374,12 +1386,23 @@ class MoRIIOConnectorWorker:
             self._read_blocks_for_req(req_id, meta)
         # Start transfers for requests whose handshakes have now finished.
 
+        if remote_engine_id is None and not wait_handshake_readd_req:
+            return
+        _deadline = time.monotonic() + envs.VLLM_MORIIO_TRANSFER_TIMEOUT
         while True:
             if (
                 self._ready_requests.empty()
                 and remote_engine_id not in self.load_ready_flag
                 and wait_handshake_readd_req
             ):
+                if time.monotonic() > _deadline:
+                    logger.warning(
+                        "Timed out waiting for load_ready_flag[%s]; "
+                        "adjust with VLLM_MORIIO_TRANSFER_TIMEOUT",
+                        remote_engine_id,
+                    )
+                    break
+                time.sleep(0.001)
                 continue
             elif (
                 not self._ready_requests.empty()
