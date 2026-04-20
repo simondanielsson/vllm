@@ -1336,7 +1336,6 @@ class MoRIIOConnectorWorker:
         if self.mode == MoRIIOMode.WRITE:
             return
 
-        wait_handshake_readd_req = False
         remote_engine_id = None
 
         for req_id, meta in metadata.reqs_to_recv.items():
