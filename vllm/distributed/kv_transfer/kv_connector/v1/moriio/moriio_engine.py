@@ -540,13 +540,13 @@ class MoRIIOWrapper:
                 else:
                     still_waiting.append(status)
             remaining = still_waiting
-            if errors:
-                raise TransferError(
-                    f"{len(errors)}/{len(transfers_to_wait)} transfers failed:\n"
-                    + "\n".join(errors)
-                )
             if remaining:
                 time.sleep(0.001)
+        if errors:
+            raise TransferError(
+                f"{len(errors)}/{len(transfers_to_wait)} transfers failed:\n"
+                + "\n".join(errors)
+            )
 
     def async_wait_reqid(self):
         assert self.notify_port is not None, "Notify port cannot be None"
