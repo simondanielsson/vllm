@@ -445,6 +445,9 @@ RUN echo "VLLM_BASE_IMAGE=${BASE_IMAGE}" >> ${COMMON_WORKDIR}/versions.txt
 # MoRI v1.1.0+ auto-detects NICs at runtime, so this is unconditional.
 # NOTE: requires FW 235.2.86.0 and kernel drivers on the host:
 #   bnxt-en-dkms=1.10.3.235.2.86.0 bnxt-re-dkms=235.2.86.0 (from packages.broadcom.com PPA)
+RUN pip install --quiet --ignore-installed blinker \
+    && pip install --quiet quart msgpack aiohttp pyzmq
+
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
          -o /etc/apt/keyrings/broadcom-nic.asc \
