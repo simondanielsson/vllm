@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import time
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 from weakref import ref as weakref_ref
 
@@ -418,13 +418,14 @@ class MoRIIOWrapper:
             post_batch_size,
             num_worker_threads,
             poll_mode,
-            enable_notification=False,  # vLLM uses ZMQ for completion signaling
-                                        # and never calls PopInboundTransferStatus.
-                                        # With notifications enabled, ibv_post_send
-                                        # ENOMEM at high concurrency permanently
-                                        # poisons TransferStatus before the data WR
-                                        # completes, hanging requests in
-                                        # WAITING_FOR_REMOTE_KVS indefinitely.
+            # vLLM uses ZMQ for completion signaling
+            # and never calls PopInboundTransferStatus.
+            # With notifications enabled, ibv_post_send
+            # ENOMEM at high concurrency permanently
+            # poisons TransferStatus before the data WR
+            # completes, hanging requests in
+            # WAITING_FOR_REMOTE_KVS indefinitely.
+            enable_notification=False,
         )
         self.moriio_engine.create_backend(backend_type, rdma_cfg)
 

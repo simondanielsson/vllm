@@ -2120,9 +2120,7 @@ class Scheduler(SchedulerInterface):
             if req_id not in self.requests:
                 # Request was removed (finished/aborted) before the async
                 # RDMA completion was reported. Nothing left to do.
-                logger.debug(
-                    "Request %s no longer tracked, skipping recv", req_id
-                )
+                logger.debug("Request %s no longer tracked, skipping recv", req_id)
                 continue
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -2143,9 +2141,7 @@ class Scheduler(SchedulerInterface):
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
             if req_id not in self.requests:
-                logger.debug(
-                    "Request %s no longer tracked, skipping send", req_id
-                )
+                logger.debug("Request %s no longer tracked, skipping send", req_id)
                 continue
             self._free_blocks(self.requests[req_id])
 
