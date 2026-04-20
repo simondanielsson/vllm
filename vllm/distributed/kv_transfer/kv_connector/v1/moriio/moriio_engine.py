@@ -516,26 +516,34 @@ class MoRIIOWrapper:
         timeout = envs.VLLM_MORIIO_TRANSFER_TIMEOUT
         deadline = time.monotonic() + timeout
         remaining = list(transfers_to_wait)
+        errors: list[str] = []
 
         while remaining:
-            if time.monotonic() > deadline:
-                raise TransferError(
-                    f"RDMA transfer timed out after {timeout:.0f}s "
-                    f"({len(remaining)}/{len(transfers_to_wait)} transfers still "
-                    f"in progress). Check NIC queue depth or reduce concurrency; "
-                    f"adjust with VLLM_MORIIO_TRANSFER_TIMEOUT."
-                )
+            timed_out = time.monotonic() > deadline
             still_waiting = []
             for status in remaining:
                 if status.Succeeded():
                     continue
                 if status.Failed():
-                    raise TransferError(
+                    errors.append(
                         f"RDMA transfer failed: {status.Message()} "
                         f"(code={status.Code()})"
                     )
-                still_waiting.append(status)
+                    continue
+                if timed_out:
+                    errors.append(
+                        f"RDMA transfer timed out after {timeout:.0f}s. "
+                        f"Check NIC queue depth or reduce concurrency; "
+                        f"adjust with VLLM_MORIIO_TRANSFER_TIMEOUT."
+                    )
+                else:
+                    still_waiting.append(status)
             remaining = still_waiting
+            if errors:
+                raise TransferError(
+                    f"{len(errors)}/{len(transfers_to_wait)} transfers failed:\n"
+                    + "\n".join(errors)
+                )
             if remaining:
                 time.sleep(0.001)
 
