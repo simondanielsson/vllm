@@ -1225,8 +1225,14 @@ class MoRIIOConnectorWorker:
         done_sending, done_recving = set(), set()
 
         if self.is_producer:
-            done_sending = self.moriio_wrapper.pop_finished_req_ids()
-
+            # pop_finished_req_ids returns transfer_ids (the ZMQ payload sent
+            # by decode via send_notify); map back to req_ids for the scheduler.
+            raw_done_sending = self.moriio_wrapper.pop_finished_req_ids()
+            done_sending = {
+                self.transfer_id_to_request_id[xfer_id]
+                for xfer_id in raw_done_sending
+                if xfer_id in self.transfer_id_to_request_id
+            }
         else:
             if self.mode == MoRIIOMode.WRITE:
                 done_recving = self.moriio_wrapper.pop_finished_write_req_ids()
