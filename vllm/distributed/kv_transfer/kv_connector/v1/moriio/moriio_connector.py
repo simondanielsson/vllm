@@ -1249,8 +1249,11 @@ class MoRIIOConnectorWorker:
                 last = status_list[-1]
                 if last.Succeeded():
                     done_req_ids.add(req_id)
+                    transfer_id = self.request_id_to_transfer_id.get(
+                        req_id, req_id
+                    )
                     self.moriio_wrapper.send_notify(
-                        req_id,
+                        transfer_id,
                         self._recving_transfers_callback_addr[req_id][0],
                         self._recving_transfers_callback_addr[req_id][1],
                     )
@@ -1264,9 +1267,12 @@ class MoRIIOConnectorWorker:
                         last.Message(),
                         last.Code(),
                     )
+                    transfer_id = self.request_id_to_transfer_id.get(
+                        req_id, req_id
+                    )
                     try:
                         self.moriio_wrapper.send_notify(
-                            req_id,
+                            transfer_id,
                             self._recving_transfers_callback_addr[req_id][0],
                             self._recving_transfers_callback_addr[req_id][1],
                         )
