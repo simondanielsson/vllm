@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 import threading
 from typing import TYPE_CHECKING, Any
 from weakref import ref as weakref_ref
@@ -136,22 +137,54 @@ class MoRIIOWriter:
                 continue
 
             # Execute the task
-
-            self._execute_write_task(task)
+            try:
+                self._execute_write_task(task)
+            except Exception:
+                logger.exception(
+                    "Write task failed for request %s, marking done",
+                    task.request_id,
+                )
+                self._mark_request_done(task.request_id, task.transfer_id)
 
     def _process_deferred_tasks(self) -> None:
         """Process tasks that were previously deferred."""
         if not self._deferred_tasks:
             return
 
+        defer_timeout = envs.VLLM_MORIIO_DEFER_TIMEOUT
+        now = time.perf_counter()
         still_deferred: list[WriteTask] = []
+
         for task in self._deferred_tasks:
+            if now - task.enqueue_time > defer_timeout:
+                logger.error(
+                    "Deferred write task for request %s expired after %.1fs "
+                    "(remote blocks never arrived), marking done",
+                    task.request_id,
+                    now - task.enqueue_time,
+                )
+                self._mark_request_done(task.request_id, task.transfer_id)
+                continue
             if self._is_remote_ready(task):
-                self._execute_write_task(task)
+                try:
+                    self._execute_write_task(task)
+                except Exception:
+                    logger.exception(
+                        "Deferred write task failed for request %s, marking done",
+                        task.request_id,
+                    )
+                    self._mark_request_done(task.request_id, task.transfer_id)
             else:
                 still_deferred.append(task)
 
         self._deferred_tasks = still_deferred
+
+    def _mark_request_done(self, request_id: str, transfer_id: str) -> None:
+        """Mark a request done so its blocks are freed, even on transfer failure."""
+        wrapper = self.worker.moriio_wrapper
+        with wrapper.lock:
+            wrapper.done_req_ids.append(request_id)
+        wrapper.done_remote_allocate_req_dict.pop(transfer_id, None)
 
     def _is_remote_ready(self, task: WriteTask) -> bool:
         """Check if remote blocks are allocated for this task.
@@ -385,6 +418,13 @@ class MoRIIOWrapper:
             post_batch_size,
             num_worker_threads,
             poll_mode,
+            enable_notification=False,  # vLLM uses ZMQ for completion signaling
+                                        # and never calls PopInboundTransferStatus.
+                                        # With notifications enabled, ibv_post_send
+                                        # ENOMEM at high concurrency permanently
+                                        # poisons TransferStatus before the data WR
+                                        # completes, hanging requests in
+                                        # WAITING_FOR_REMOTE_KVS indefinitely.
         )
         self.moriio_engine.create_backend(backend_type, rdma_cfg)
 
@@ -469,22 +509,35 @@ class MoRIIOWrapper:
         if not self.transfer_status:
             return
 
-        transfers_to_wait = []
         with self.lock:
             transfers_to_wait = self.transfer_status[:]
             self.transfer_status.clear()
 
-        for status in transfers_to_wait:
-            try:
-                status.Wait()
-                if not status.Succeeded():
-                    logger.error(
-                        "Transfer failed: %s, Code: %s", status.Message(), status.Code()
+        timeout = envs.VLLM_MORIIO_TRANSFER_TIMEOUT
+        deadline = time.monotonic() + timeout
+        remaining = list(transfers_to_wait)
+
+        while remaining:
+            if time.monotonic() > deadline:
+                raise TransferError(
+                    f"RDMA transfer timed out after {timeout:.0f}s "
+                    f"({len(remaining)}/{len(transfers_to_wait)} transfers still "
+                    f"in progress). Check NIC queue depth or reduce concurrency; "
+                    f"adjust with VLLM_MORIIO_TRANSFER_TIMEOUT."
+                )
+            still_waiting = []
+            for status in remaining:
+                if status.Succeeded():
+                    continue
+                if status.Failed():
+                    raise TransferError(
+                        f"RDMA transfer failed: {status.Message()} "
+                        f"(code={status.Code()})"
                     )
-                    raise TransferError("MoRIIO transfer failed!")
-            except Exception as e:
-                logger.error("Transfer %s failed: %s", status, e)
-                raise
+                still_waiting.append(status)
+            remaining = still_waiting
+            if remaining:
+                time.sleep(0.001)
 
     def async_wait_reqid(self):
         assert self.notify_port is not None, "Notify port cannot be None"

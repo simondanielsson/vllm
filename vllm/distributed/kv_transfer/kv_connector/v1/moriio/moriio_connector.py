@@ -1246,15 +1246,38 @@ class MoRIIOConnectorWorker:
         with self.moriio_wrapper.lock:
             to_remove = []
             for req_id, status_list in self._recving_transfers.items():
-                if status_list[-1].Succeeded():
+                last = status_list[-1]
+                if last.Succeeded():
                     done_req_ids.add(req_id)
-
                     self.moriio_wrapper.send_notify(
                         req_id,
                         self._recving_transfers_callback_addr[req_id][0],
                         self._recving_transfers_callback_addr[req_id][1],
                     )
                     to_remove.append(req_id)
+                elif last.Failed():
+                    logger.error(
+                        "RDMA transfer failed for request %s: %s (code=%s). "
+                        "Notifying prefill to free blocks; request will be "
+                        "aborted by timeout.",
+                        req_id,
+                        last.Message(),
+                        last.Code(),
+                    )
+                    try:
+                        self.moriio_wrapper.send_notify(
+                            req_id,
+                            self._recving_transfers_callback_addr[req_id][0],
+                            self._recving_transfers_callback_addr[req_id][1],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to send error notification for request %s",
+                            req_id,
+                        )
+                    to_remove.append(req_id)
+                    # Do NOT add to done_req_ids: decode KV cache is incomplete.
+                    # The request will expire via the normal request timeout.
             for req_id in to_remove:
                 del self._recving_transfers[req_id]
                 del self._recving_transfers_callback_addr[req_id]
@@ -1295,21 +1318,13 @@ class MoRIIOConnectorWorker:
                         continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
-        while True:
-            if (
-                self._ready_requests.empty()
-                and remote_engine_id not in self.write_ready_flags
-            ):
-                continue
-            elif not self._ready_requests.empty() and (
-                remote_engine_id in self.write_ready_flags
-            ):
-                self._write_blocks_for_req(
-                    *self._ready_requests.get_nowait(), layer_name, kv_layer
-                )
-                break
-            else:
-                break
+        # Drain any requests whose background handshakes just completed.
+        # Requests whose handshakes are still in progress will be retried
+        # on the next scheduler step when save_kv_layer is called again.
+        while not self._ready_requests.empty():
+            req_id, meta = self._ready_requests.get_nowait()
+            if meta.remote_engine_id in self.write_ready_flags:
+                self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
     def get_engine_name_with_dp(self, engine_name, dp_rank):
         return f"{engine_name}_dp{dp_rank}"
@@ -1350,21 +1365,13 @@ class MoRIIOConnectorWorker:
             self._read_blocks_for_req(req_id, meta)
         # Start transfers for requests whose handshakes have now finished.
 
-        while True:
-            if (
-                self._ready_requests.empty()
-                and remote_engine_id not in self.load_ready_flag
-                and wait_handshake_readd_req
-            ):
-                continue
-            elif (
-                not self._ready_requests.empty()
-                and remote_engine_id in self.load_ready_flag
-            ):
-                self._read_blocks_for_req(*self._ready_requests.get_nowait())
-                break
-            else:
-                break
+        # Drain any requests whose background handshakes just completed.
+        # Requests whose handshakes are still in progress will be retried
+        # on the next scheduler step when start_load_kv is called again.
+        while not self._ready_requests.empty():
+            req_id, meta = self._ready_requests.get_nowait()
+            if meta.remote_engine_id in self.load_ready_flag:
+                self._read_blocks_for_req(req_id, meta)
 
         self._reqs_to_send.update(metadata.reqs_to_send)
 
