@@ -1262,8 +1262,8 @@ class MoRIIOConnectorWorker:
             for req_id, status_list in self._recving_transfers.items():
                 last = status_list[-1]
                 if last.Succeeded():
-                    done_req_ids.add(req_id)
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(xfer_id, host, port)
                     to_remove.append(req_id)
                 elif last.Failed():
