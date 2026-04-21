@@ -144,7 +144,7 @@ class MoRIIOWriter:
                     "Write task failed for request %s, marking done",
                     task.request_id,
                 )
-                self._mark_request_done(task.request_id, task.transfer_id)
+                self._mark_request_done(task.transfer_id)
 
     def _process_deferred_tasks(self) -> None:
         """Process tasks that were previously deferred."""
@@ -163,7 +163,7 @@ class MoRIIOWriter:
                     task.request_id,
                     now - task.enqueue_time,
                 )
-                self._mark_request_done(task.request_id, task.transfer_id)
+                self._mark_request_done(task.transfer_id)
                 continue
             if self._is_remote_ready(task):
                 try:
@@ -173,17 +173,17 @@ class MoRIIOWriter:
                         "Deferred write task failed for request %s, marking done",
                         task.request_id,
                     )
-                    self._mark_request_done(task.request_id, task.transfer_id)
+                    self._mark_request_done(task.transfer_id)
             else:
                 still_deferred.append(task)
 
         self._deferred_tasks = still_deferred
 
-    def _mark_request_done(self, request_id: str, transfer_id: str) -> None:
+    def _mark_request_done(self, transfer_id: str) -> None:
         """Mark a request done so its blocks are freed, even on transfer failure."""
         wrapper = self.worker.moriio_wrapper
         with wrapper.lock:
-            wrapper.done_req_ids.append(request_id)
+            wrapper.done_req_ids.append(transfer_id)
         wrapper.done_remote_allocate_req_dict.pop(transfer_id, None)
 
     def _is_remote_ready(self, task: WriteTask) -> bool:
