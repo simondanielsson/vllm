@@ -2,7 +2,12 @@
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=rocm/vllm-dev:base
-# AMD NIC backend
+# NIC backend for MoRI RDMA support.
+# By default (none), drivers and userspace libraries for all supported NIC types
+# (ainic and bnxt) are installed; MoRI selects the appropriate one at runtime.
+# To install drivers for a single NIC type only, set NIC_BACKEND explicitly:
+#   --build-arg NIC_BACKEND=ainic   # AMD AINIC (Pensando) only
+#   --build-arg NIC_BACKEND=bnxt    # Broadcom Thor-2 only
 ARG NIC_BACKEND=none
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
