@@ -170,6 +170,12 @@ class MoRIIOConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def get_block_leak_reap_timeout(self) -> float | None:
+        # ibv_post_send failures under high concurrency can silently drop the
+        # finished_sending notification, leaving KV blocks permanently allocated
+        # on the prefill side. The reaper frees them after this idle period.
+        return envs.VLLM_MORIIO_DEFER_TIMEOUT
+
     ############################################################
     # Worker Side Methods
     ############################################################
