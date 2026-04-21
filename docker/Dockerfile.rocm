@@ -252,12 +252,25 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
-    # TODO: Add Broadcom bnxt packages/repos here later.
-    # bnxt) \
-    #   echo "[MORI] Add Broadcom bnxt packages/repos here later."; \
-    #   ;; \
+    # Broadcom Thor-2 NIC
+    # NOTE: requires FW 235.2.86.0 and kernel drivers on the host:
+    #   bnxt-en-dkms=1.10.3.235.2.86.0 bnxt-re-dkms=235.2.86.0 (from packages.broadcom.com PPA)
+    bnxt) \
+      install -m 0755 -d /etc/apt/keyrings; \
+      curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
+        -o /etc/apt/keyrings/broadcom-nic.asc; \
+      chmod a+r /etc/apt/keyrings/broadcom-nic.asc; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
+        > /etc/apt/sources.list.d/broadcom-nic.list; \
+      apt-get update && apt-get install -y --no-install-recommends \
+        bnxt-rocelib=235.2.86.0 \
+      ; \
+      cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/; \
+      ldconfig; \
+      rm -rf /var/lib/apt/lists/*; \
+      ;; \
     *) \
-      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
+      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic, bnxt"; \
       exit 2; \
       ;; \
   esac;'
@@ -490,26 +503,6 @@ ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
 RUN echo "VLLM_BASE_IMAGE=${BASE_IMAGE}" >> ${COMMON_WORKDIR}/versions.txt \
     && echo "MORI_NIC_BACKEND=${NIC_BACKEND}" >> ${COMMON_WORKDIR}/versions.txt \
     && echo "AINIC_VERSION=${AINIC_VERSION}" >> ${COMMON_WORKDIR}/versions.txt
-
-# Install Broadcom Thor-2 (bnxt) ROCE userspace library.
-# MoRI v1.1.0+ auto-detects NICs at runtime, so this is unconditional.
-# NOTE: requires FW 235.2.86.0 and kernel drivers on the host:
-#   bnxt-en-dkms=1.10.3.235.2.86.0 bnxt-re-dkms=235.2.86.0 (from packages.broadcom.com PPA)
-RUN pip install --quiet --ignore-installed blinker \
-    && pip install --quiet quart msgpack aiohttp pyzmq
-
-RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
-         -o /etc/apt/keyrings/broadcom-nic.asc \
-    && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
-    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
-         > /etc/apt/sources.list.d/broadcom-nic.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-         bnxt-rocelib=235.2.86.0 \
-    && cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/ \
-    && ldconfig \
-    && rm -rf /var/lib/apt/lists/*
 
 CMD ["/bin/bash"]
 
