@@ -22,10 +22,6 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
 )
-from vllm.distributed.nixl_utils import (
-    NixlWrapper,
-    nixl_agent_config,
-)
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_pp_group,
@@ -40,6 +36,8 @@ logger = init_logger(__name__)
 
 def has_nixl() -> bool:
     """Whether the optional NIXL / RIXL package is available."""
+    from vllm.distributed.nixl_utils import NixlWrapper
+
     return NixlWrapper is not None
 
 
@@ -200,6 +198,8 @@ class NixlEplbCommunicator(EplbCommunicator):
         expert_weights: Sequence[torch.Tensor],
         cuda_stream: torch.cuda.Stream | None = None,
     ) -> None:
+        from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
+
         assert expert_weights, "NixlEplbCommunicator requires non-empty expert_weights."
         if NixlWrapper is None:
             raise RuntimeError("NIXL/ RIXL is unavailable.")
