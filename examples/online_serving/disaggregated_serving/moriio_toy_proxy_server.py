@@ -11,7 +11,7 @@ import uuid
 import aiohttp
 import msgpack
 import zmq
-from quart import Quart, make_response, request
+from quart import Quart, Request, make_response, request
 
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConstants,
@@ -64,9 +64,10 @@ def _listen_for_register(hostname, port):
                     )
                     continue
                 # Derive request_address from http_address
+                # api path suffix is appended at request time
                 instance = {
                     "role": role,
-                    "request_address": f"http://{data['http_address']}/v1/completions",
+                    "request_address": f"http://{data['http_address']}/v1",
                     "http_address": data["http_address"],
                     "zmq_address": data["zmq_address"],
                     "dp_size": data["dp_size"],
@@ -169,10 +170,13 @@ async def send_request_to_prefill(
                 return await response.json()
 
             else:
-                raise RuntimeError(
-                    "send_request_to_prefill response.status != 200response.status = ",
-                    response.status,
+                error_message = (
+                    f"send_request_to_prefill response ={response},"
+                    f"reason={response.reason}, status={response.status},"
+                    f"method={response.method}, url={response.url},"
+                    f"real_url={response.real_url}"
                 )
+                raise RuntimeError(error_message)
 
 
 async def start_decode_request(endpoint, req_data, request_id):
@@ -193,9 +197,13 @@ async def stream_decode_response(session, response, request_id):
             async for chunk_bytes in response.content.iter_chunked(1024):
                 yield chunk_bytes
         else:
-            raise RuntimeError(
-                f"decode response.status != 200, status = {response.status}"
+            error_message = (
+                f"stream_decode_response response ={response},"
+                f"reason={response.reason}, status={response.status},"
+                f"method={response.method}, url={response.url},"
+                f"real_url={response.real_url}"
             )
+            raise RuntimeError(error_message)
     finally:
         await session.close()
 
@@ -205,8 +213,16 @@ def example_round_robin_dp_loader(request_number, dp_size):
 
 
 @app.route("/v1/completions", methods=["POST"])
+async def handle_completions_request():
+    return await handle_request("/completions", request)
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
-async def handle_request():
+async def handle_chat_completions_request():
+    return await handle_request("/chat/completions", request)
+
+
+async def handle_request(api: str, request: Request):
     try:
         with _list_lock:
             global request_nums
@@ -260,9 +276,10 @@ async def handle_request():
         )
         req_data_to_prefill["kv_transfer_params"]["transfer_id"] = transfer_id
 
+        prefill_request_url = prefill_instance_endpoint["request_address"] + api
         send_prefill_task = asyncio.create_task(
             send_request_to_prefill(
-                prefill_instance_endpoint["request_address"],
+                prefill_request_url,
                 req_data_to_prefill,
                 request_id,
                 selected_prefill_dp_rank,
@@ -300,10 +317,9 @@ async def handle_request():
         if selected_prefill_dp_rank is not None:
             req_data["kv_transfer_params"]["remote_dp_rank"] = selected_prefill_dp_rank
 
+        decode_request_url = decode_instance_endpoint["request_address"] + api
         decode_request_task = asyncio.create_task(
-            start_decode_request(
-                decode_instance_endpoint["request_address"], req_data, request_id
-            )
+            start_decode_request(decode_request_url, req_data, request_id)
         )
 
         session, decode_response = await decode_request_task
