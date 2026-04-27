@@ -415,9 +415,7 @@ class MoRIIOConnectorScheduler:
                         )
 
             else:
-                # WRITE mode: prefill scheduler notifies the decode side that
-                # blocks are ready.  Parse the decode's host/notify_port from
-                # the request_id
+                # WRITE mode, decode side: notify P that blocks are ready
                 assert request.kv_transfer_params is not None, (
                     "kv_transfer_params should not be None"
                 )
@@ -425,7 +423,7 @@ class MoRIIOConnectorScheduler:
                 remote_dp_rank = request.kv_transfer_params.get("remote_dp_rank", 0)
 
                 peer_zmq = get_peer_zmq_from_request_id(
-                    request.request_id, is_producer=True
+                    request.request_id, is_producer=False
                 )
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
 
