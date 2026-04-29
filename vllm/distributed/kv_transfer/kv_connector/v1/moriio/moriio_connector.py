@@ -666,6 +666,9 @@ class MoRIIOConnectorWorker:
         self._handle_request_thread = None
         self._ping_thread = None
         self._writer = MoRIIOWriter(self)
+        # Completions that arrived before transfer_id_to_request_id was populated.
+        # Retried each step until the mapping is established.
+        self._unmatched_write_completions: set[str] = set()
 
         role = "producer" if self.is_producer else "consumer"
         engine_suffix = (
@@ -1260,7 +1263,11 @@ class MoRIIOConnectorWorker:
             }
         else:
             if self.mode == MoRIIOMode.WRITE:
-                done_recving = self.moriio_wrapper.pop_finished_write_req_ids()
+                fresh = self.moriio_wrapper.pop_finished_write_req_ids()
+                # Accumulate with any completions that arrived before their
+                # transfer_id was registered in transfer_id_to_request_id.
+                self._unmatched_write_completions |= fresh
+                done_recving = self._unmatched_write_completions
             else:
                 done_recving = self._pop_done_transfers()
 
@@ -1270,6 +1277,13 @@ class MoRIIOConnectorWorker:
                 lambda id: id in self.transfer_id_to_request_id, done_recving
             )
         }
+        if self.mode == MoRIIOMode.WRITE and not self.is_producer:
+            # Remove the ones we successfully matched; leave unmatched for retry.
+            matched_xfer_ids = {
+                id for id in self._unmatched_write_completions
+                if id in self.transfer_id_to_request_id
+            }
+            self._unmatched_write_completions -= matched_xfer_ids
 
         return done_sending, done_recving
 
