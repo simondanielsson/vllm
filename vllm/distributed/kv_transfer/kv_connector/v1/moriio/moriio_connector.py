@@ -1280,7 +1280,8 @@ class MoRIIOConnectorWorker:
         if self.mode == MoRIIOMode.WRITE and not self.is_producer:
             # Remove the ones we successfully matched; leave unmatched for retry.
             matched_xfer_ids = {
-                id for id in self._unmatched_write_completions
+                id
+                for id in self._unmatched_write_completions
                 if id in self.transfer_id_to_request_id
             }
             self._unmatched_write_completions -= matched_xfer_ids
