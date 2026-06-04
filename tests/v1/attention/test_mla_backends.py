@@ -77,7 +77,17 @@ PREFILL_BACKENDS_TO_TEST = [
     MLAPrefillBackendEnum.FLASHINFER,
     MLAPrefillBackendEnum.TRTLLM_RAGGED,
     MLAPrefillBackendEnum.TOKENSPEED_MLA,
+    MLAPrefillBackendEnum.AITER_ASM,
 ]
+
+# Remove AITER_ASM if not running on gfx950 with an AITER build that exports
+# the PS ASM kernels.
+try:
+    _aiter_asm_cls = MLAPrefillBackendEnum.AITER_ASM.get_class()
+    if not _aiter_asm_cls.is_available():
+        PREFILL_BACKENDS_TO_TEST.remove(MLAPrefillBackendEnum.AITER_ASM)
+except ImportError:
+    PREFILL_BACKENDS_TO_TEST.remove(MLAPrefillBackendEnum.AITER_ASM)
 
 
 SPEC_DECODE_BACKENDS = []
@@ -773,7 +783,11 @@ def test_backend_correctness(
     try:
         prefill_invalid_reasons = prefill_backend.get_class().validate_configuration(
             current_platform.get_device_capability(),
-            MLAPrefillSelectorConfig(dtype=torch.bfloat16, is_r1_compatible=True),
+            MLAPrefillSelectorConfig(
+                dtype=torch.bfloat16,
+                is_r1_compatible=True,
+                cache_dtype=kv_cache_dtype,
+            ),
         )
     except ImportError:
         prefill_invalid_reasons = ["ImportError"]
