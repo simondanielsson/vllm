@@ -50,6 +50,9 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
     supported_dtypes = [torch.float16, torch.bfloat16]
     requires_r1_mla_dimensions = True
+    # mla_prefill_ps_asm_fwd only accepts FP8 Q/K/V; force the cast in the
+    # parent regardless of attention_config.use_prefill_query_quantization.
+    requires_fp8_query_quantization = True
 
     @staticmethod
     def get_name() -> str:
