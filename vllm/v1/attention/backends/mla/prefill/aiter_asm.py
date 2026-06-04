@@ -365,11 +365,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
         out_dtype = self._prefill_metadata.output_dtype
         assert out_dtype is not None
-        # Use zeros instead of empty: mla_reduce_v1 may be read-modify-write,
-        # so uninitialized garbage in `out` can corrupt the final reduction.
-        # Nightly's _mla_fp8_prefill_attn avoids this by writing into the
-        # caller's `output` buffer directly.
-        out = torch.zeros(
+        out = torch.empty(
             (total_q, nhead, v_head_dim),
             dtype=out_dtype,
             device=q.device,
