@@ -2121,7 +2121,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             if (
                 use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
             ) and _kv_b_proj_w_dtype != torch.uint8:
-                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
+                input_dtype = self.kv_b_proj.weight.dtype
+                # ROCm BlockScaledMM quantizes input internally, so cast to model dtype
+                if (
+                    current_platform.is_rocm()
+                    and input_dtype == current_platform.fp8_dtype()
+                ):
+                    assert prefill_metadata.output_dtype is not None
+                    input_dtype = prefill_metadata.output_dtype
+                kv_c_normed = kv_c_normed.to(input_dtype)
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
