@@ -134,6 +134,59 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._new_tokens_ps: dict | None = None
         self._context_ps: list[dict] = []
 
+        # Worst-case sizes used to pre-allocate persistent PS buffers for the
+        # new-tokens chunk. Mirrors PR #42509: declaring max sizes up-front
+        # changes the PS scheduler's K-split layout vs allocating with exact
+        # per-batch sizes, which empirically affected gsm8k accuracy.
+        self._ps_max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self._ps_max_qlen = min(
+            vllm_config.model_config.max_model_len,
+            vllm_config.scheduler_config.max_num_batched_tokens,
+        )
+        # Lazy init on first prepare_metadata call (need device).
+        self._persistent_new_tokens_buffers: dict | None = None
+
+    def _ensure_persistent_buffers(self, device: torch.device) -> None:
+        if self._persistent_new_tokens_buffers is not None:
+            return
+        (
+            (work_metadata_size, work_metadata_dtype),
+            (work_indptr_size, work_indptr_dtype),
+            (work_info_size, work_info_dtype),
+            (reduce_indptr_size, reduce_indptr_dtype),
+            (reduce_final_map_size, reduce_final_map_dtype),
+            (reduce_partial_map_size, reduce_partial_map_dtype),
+        ) = self._get_ps_metadata_info_v1(
+            batch_size=self._ps_max_num_reqs,
+            num_head_k=self.num_heads,
+            max_qlen=self._ps_max_qlen,
+            qlen_granularity=_FP8_PREFILL_TILE_Q,
+        )
+        self._persistent_new_tokens_buffers = {
+            "work_metadata": torch.empty(
+                work_metadata_size, dtype=work_metadata_dtype, device=device
+            ),
+            "work_indptr": torch.empty(
+                work_indptr_size, dtype=work_indptr_dtype, device=device
+            ),
+            "work_info": torch.empty(
+                *work_info_size, dtype=work_info_dtype, device=device
+            ),
+            "reduce_indptr": torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_dtype, device=device
+            ),
+            "reduce_final_map": torch.empty(
+                *reduce_final_map_size,
+                dtype=reduce_final_map_dtype,
+                device=device,
+            ),
+            "reduce_partial_map": torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_dtype,
+                device=device,
+            ),
+        }
+
     def _build_ps_for_chunk(
         self,
         qo_indptr_cpu: torch.Tensor,
@@ -141,6 +194,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         seq_lens_cpu: torch.Tensor,
         is_causal: bool,
         device: torch.device,
+        persistent: bool = False,
     ) -> dict:
         """Allocate and populate persistent device buffers.
 
@@ -153,40 +207,53 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         batch_size = seq_lens_cpu.numel()
         num_head_k = self.num_heads
 
-        (
-            (work_metadata_size, work_metadata_dtype),
-            (work_indptr_size, work_indptr_dtype),
-            (work_info_size, work_info_dtype),
-            (reduce_indptr_size, reduce_indptr_dtype),
-            (reduce_final_map_size, reduce_final_map_dtype),
-            (reduce_partial_map_size, reduce_partial_map_dtype),
-        ) = self._get_ps_metadata_info_v1(
-            batch_size=batch_size,
-            num_head_k=num_head_k,
-            max_qlen=max_qlen,
-            qlen_granularity=_FP8_PREFILL_TILE_Q,
-        )
+        if persistent:
+            self._ensure_persistent_buffers(device)
+            assert self._persistent_new_tokens_buffers is not None
+            buffers = self._persistent_new_tokens_buffers
+            work_metadata = buffers["work_metadata"]
+            work_indptr = buffers["work_indptr"]
+            work_info = buffers["work_info"]
+            reduce_indptr = buffers["reduce_indptr"]
+            reduce_final_map = buffers["reduce_final_map"]
+            reduce_partial_map = buffers["reduce_partial_map"]
+        else:
+            (
+                (work_metadata_size, work_metadata_dtype),
+                (work_indptr_size, work_indptr_dtype),
+                (work_info_size, work_info_dtype),
+                (reduce_indptr_size, reduce_indptr_dtype),
+                (reduce_final_map_size, reduce_final_map_dtype),
+                (reduce_partial_map_size, reduce_partial_map_dtype),
+            ) = self._get_ps_metadata_info_v1(
+                batch_size=batch_size,
+                num_head_k=num_head_k,
+                max_qlen=max_qlen,
+                qlen_granularity=_FP8_PREFILL_TILE_Q,
+            )
 
-        work_metadata = torch.empty(
-            work_metadata_size, dtype=work_metadata_dtype, device=device
-        )
-        work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_dtype, device=device
-        )
-        work_info = torch.empty(*work_info_size, dtype=work_info_dtype, device=device)
-        reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_dtype, device=device
-        )
-        reduce_final_map = torch.empty(
-            *reduce_final_map_size,
-            dtype=reduce_final_map_dtype,
-            device=device,
-        )
-        reduce_partial_map = torch.empty(
-            reduce_partial_map_size,
-            dtype=reduce_partial_map_dtype,
-            device=device,
-        )
+            work_metadata = torch.empty(
+                work_metadata_size, dtype=work_metadata_dtype, device=device
+            )
+            work_indptr = torch.empty(
+                work_indptr_size, dtype=work_indptr_dtype, device=device
+            )
+            work_info = torch.empty(
+                *work_info_size, dtype=work_info_dtype, device=device
+            )
+            reduce_indptr = torch.empty(
+                reduce_indptr_size, dtype=reduce_indptr_dtype, device=device
+            )
+            reduce_final_map = torch.empty(
+                *reduce_final_map_size,
+                dtype=reduce_final_map_dtype,
+                device=device,
+            )
+            reduce_partial_map = torch.empty(
+                reduce_partial_map_size,
+                dtype=reduce_partial_map_dtype,
+                device=device,
+            )
 
         self._get_ps_metadata_v1(
             qo_indptr_cpu,
@@ -240,6 +307,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             seq_lens_cpu=q_seq_lens_cpu,
             is_causal=True,
             device=device,
+            persistent=True,
         )
         total_q = int(qo_indptr_cpu[-1].item())
         ps["qo_indptr"] = qo_indptr
