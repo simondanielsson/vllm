@@ -455,7 +455,10 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             out,
             final_lse,
         )
-        return out, final_lse
+        # AITER mla_reduce_v1 writes final_lse as (total_q, num_heads).
+        # vLLM's merge_attn_states and the FA-based MLA paths expect
+        # (num_heads, total_q), so transpose to match the contract.
+        return out, final_lse.transpose(0, 1).contiguous()
 
     def run_prefill_new_tokens(
         self,
