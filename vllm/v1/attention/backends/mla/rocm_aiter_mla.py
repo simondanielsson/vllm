@@ -505,7 +505,18 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         """
         import os
 
-        if os.environ.get("VLLM_USE_LEGACY_MLA_FP8_PREFILL") != "1":
+        env_val = os.environ.get("VLLM_USE_LEGACY_MLA_FP8_PREFILL")
+        if not hasattr(self, "_logged_legacy_branch"):
+            self._logged_legacy_branch = {}
+
+        if env_val != "1":
+            if "env_off" not in self._logged_legacy_branch:
+                logger.info(
+                    "AiterMLAImpl.forward_mha: legacy path OFF "
+                    "(VLLM_USE_LEGACY_MLA_FP8_PREFILL=%r)",
+                    env_val,
+                )
+                self._logged_legacy_branch["env_off"] = True
             return super().forward_mha(
                 q,
                 kv_c_normed,
@@ -516,10 +527,33 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 output,
             )
 
-        assert attn_metadata.prefill is not None
+        if attn_metadata.prefill is None:
+            if "no_prefill" not in self._logged_legacy_branch:
+                logger.info(
+                    "AiterMLAImpl.forward_mha: legacy fallthrough — "
+                    "attn_metadata.prefill is None"
+                )
+                self._logged_legacy_branch["no_prefill"] = True
+            return super().forward_mha(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+                output,
+            )
+
         prefill_metadata = attn_metadata.prefill
         has_context = prefill_metadata.chunked_context is not None
         if has_context:
+            if "has_context" not in self._logged_legacy_branch:
+                logger.info(
+                    "AiterMLAImpl.forward_mha: legacy fallthrough — "
+                    "chunked_context is set (n_chunks=%d)",
+                    len(prefill_metadata.chunked_context.cu_seq_lens),
+                )
+                self._logged_legacy_branch["has_context"] = True
             return super().forward_mha(
                 q,
                 kv_c_normed,
@@ -538,6 +572,13 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         )
 
         if not isinstance(backend, AiterAsmPrefillBackend):
+            if "wrong_backend" not in self._logged_legacy_branch:
+                logger.info(
+                    "AiterMLAImpl.forward_mha: legacy fallthrough — "
+                    "backend is %s, not AiterAsmPrefillBackend",
+                    type(backend).__name__,
+                )
+                self._logged_legacy_branch["wrong_backend"] = True
             return super().forward_mha(
                 q,
                 kv_c_normed,
@@ -547,6 +588,15 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 k_scale,
                 output,
             )
+
+        if "legacy_fire" not in self._logged_legacy_branch:
+            logger.info(
+                "AiterMLAImpl.forward_mha: LEGACY PATH ACTIVE "
+                "(q.shape=%s, total_q=%d)",
+                tuple(q.shape),
+                q.shape[0],
+            )
+            self._logged_legacy_branch["legacy_fire"] = True
 
         from vllm.platforms import current_platform
         from vllm.v1.worker.workspace import current_workspace_manager
