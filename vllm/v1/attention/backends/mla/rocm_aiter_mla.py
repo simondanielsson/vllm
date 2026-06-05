@@ -482,6 +482,141 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
 
+    def forward_mha(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: AiterMLAMetadata,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Legacy-path A/B switch for debugging the FP8 MLA prefill regression.
+
+        When VLLM_USE_LEGACY_MLA_FP8_PREFILL=1 and the new-tokens-only path
+        applies (no chunked context), this runs the AITER ASM kernel inline,
+        writing directly into the caller's ``output`` buffer — mirroring
+        nightly's ``_mla_fp8_prefill_attn`` to isolate whether the alloc+copy
+        roundtrip done by the parent's backend-driven path is the culprit.
+
+        Falls through to the parent (which dispatches via AiterAsmPrefillBackend)
+        when the env var is unset or chunked context is present.
+        """
+        import os
+
+        if os.environ.get("VLLM_USE_LEGACY_MLA_FP8_PREFILL") != "1":
+            return super().forward_mha(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+                output,
+            )
+
+        assert attn_metadata.prefill is not None
+        prefill_metadata = attn_metadata.prefill
+        has_context = prefill_metadata.chunked_context is not None
+        if has_context:
+            return super().forward_mha(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+                output,
+            )
+
+        # Only valid when the AITER_ASM backend is selected (it owns the PS
+        # metadata that this inline path needs).
+        backend = prefill_metadata.prefill_backend
+        from vllm.v1.attention.backends.mla.prefill.aiter_asm import (
+            AiterAsmPrefillBackend,
+        )
+
+        if not isinstance(backend, AiterAsmPrefillBackend):
+            return super().forward_mha(
+                q,
+                kv_c_normed,
+                k_pe,
+                kv_c_and_k_pe_cache,
+                attn_metadata,
+                k_scale,
+                output,
+            )
+
+        from vllm.platforms import current_platform
+        from vllm.v1.worker.workspace import current_workspace_manager
+
+        fp8_dtype = current_platform.fp8_dtype()
+        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k = self._concat_k_nope_k_pe(k_nope, k_pe)
+
+        if q.dtype != fp8_dtype:
+            q = q.to(fp8_dtype)
+        if k.dtype != fp8_dtype:
+            k = k.to(fp8_dtype)
+        if v.dtype != fp8_dtype:
+            v = v.to(fp8_dtype)
+
+        ps = backend._new_tokens_ps
+        assert ps is not None, (
+            "Legacy path requires AiterAsmPrefillBackend.prepare_metadata "
+            "to have been called for this batch."
+        )
+        total_q = q.shape[0]
+        nhead = self.num_heads
+        v_head_dim = self.v_head_dim
+        tile_q = 256  # _FP8_PREFILL_TILE_Q
+        num_partial_tiles = ps["num_partial_tiles"]
+
+        # Direct write into caller's output buffer — the key difference vs
+        # the parent's path, which allocates a fresh `out` and copies.
+        out_3d = output.view(total_q, nhead, v_head_dim)
+        one_scale = torch.ones((), dtype=torch.float32, device=q.device)
+
+        logits, attn_lse, final_lse = current_workspace_manager().get_simultaneous(
+            ((num_partial_tiles * tile_q, nhead, v_head_dim), torch.float32),
+            ((num_partial_tiles * tile_q, nhead), torch.float32),
+            ((total_q, nhead), torch.float32),
+        )
+
+        backend._mla_prefill_ps_asm_fwd(
+            q,
+            k,
+            v,
+            ps["qo_indptr"],
+            ps["kv_indptr"],
+            ps["kv_indices"],
+            ps["work_indptr"],
+            ps["work_info"],
+            ps["max_q_len"],
+            self.scale,
+            True,  # is_causal
+            logits,
+            attn_lse,
+            out_3d,
+            one_scale,
+            one_scale,
+            one_scale,
+        )
+        backend._mla_reduce_v1(
+            logits,
+            attn_lse,
+            ps["reduce_indptr"],
+            ps["reduce_final_map"],
+            ps["reduce_partial_map"],
+            tile_q,
+            out_3d,
+            final_lse,
+        )
+
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):

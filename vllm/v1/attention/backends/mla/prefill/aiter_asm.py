@@ -29,6 +29,9 @@ _FP8_PREFILL_TILE_Q = 256
 # K-side tiling granularity required by the PS scheduler.
 _KVLEN_GRANULARITY = 128
 
+# One-shot guard for the layer-0 fingerprint log in _run_kernel.
+_LOGGED_RUN_KERNEL_FINGERPRINT = False
+
 
 def _is_fp8_cache_dtype(cache_dtype: str) -> bool:
     return cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
@@ -186,6 +189,21 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
                 device=device,
             ),
         }
+        logger.info(
+            "AITER_ASM persistent PS buffers allocated "
+            "(max_num_reqs=%d, max_qlen=%d, num_head_k=%d) "
+            "work_metadata=%s work_indptr=%s work_info=%s "
+            "reduce_indptr=%s reduce_final_map=%s reduce_partial_map=%s",
+            self._ps_max_num_reqs,
+            self._ps_max_qlen,
+            self.num_heads,
+            work_metadata_size,
+            work_indptr_size,
+            tuple(work_info_size),
+            reduce_indptr_size,
+            tuple(reduce_final_map_size),
+            reduce_partial_map_size,
+        )
 
     def _build_ps_for_chunk(
         self,
@@ -364,6 +382,28 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         num_partial_tiles = ps["num_partial_tiles"]
 
         out_dtype = self._prefill_metadata.output_dtype
+
+        global _LOGGED_RUN_KERNEL_FINGERPRINT
+        if not _LOGGED_RUN_KERNEL_FINGERPRINT and is_causal:
+            logger.info(
+                "AITER_ASM _run_kernel fingerprint: "
+                "q.shape=%s q.dtype=%s k.dtype=%s v.dtype=%s "
+                "output_dtype=%s max_q_len=%s num_partial_tiles=%s "
+                "total_q=%s scale=%.6f is_causal=%s "
+                "prefill.max_query_len=%s",
+                tuple(q.shape),
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                out_dtype,
+                ps["max_q_len"],
+                num_partial_tiles,
+                total_q,
+                self.scale,
+                is_causal,
+                getattr(self._prefill_metadata, "max_query_len", None),
+            )
+            _LOGGED_RUN_KERNEL_FINGERPRINT = True
         assert out_dtype is not None
         out = torch.empty(
             (total_q, nhead, v_head_dim),

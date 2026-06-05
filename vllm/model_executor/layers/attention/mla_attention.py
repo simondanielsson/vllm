@@ -280,6 +280,9 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+# One-shot guard for the forward_mha output-buffer diagnostic log.
+_LOGGED_FORWARD_MHA_OUTPUT_DTYPE = False
+
 _FP8_DTYPE = current_platform.fp8_dtype()
 
 
@@ -2351,6 +2354,21 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         else:
             assert isinstance(output_prefill, torch.Tensor)
             output_prefill = output_prefill.flatten(start_dim=-2)
+            global _LOGGED_FORWARD_MHA_OUTPUT_DTYPE
+            if not _LOGGED_FORWARD_MHA_OUTPUT_DTYPE:
+                logger.info(
+                    "MLACommonImpl.forward_mha output buffer: "
+                    "output.dtype=%s output.shape=%s output_prefill.dtype=%s "
+                    "output_prefill.shape=%s prefill_metadata.output_dtype=%s "
+                    "q_data_type=%s",
+                    output.dtype,
+                    tuple(output.shape),
+                    output_prefill.dtype,
+                    tuple(output_prefill.shape),
+                    getattr(prefill_metadata, "output_dtype", None),
+                    getattr(prefill_metadata, "q_data_type", None),
+                )
+                _LOGGED_FORWARD_MHA_OUTPUT_DTYPE = True
             output.copy_(output_prefill)
 
     @abstractmethod
