@@ -161,6 +161,8 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             num_head_k=self.num_heads,
             max_qlen=self._ps_max_qlen,
             qlen_granularity=_FP8_PREFILL_TILE_Q,
+            max_kvlen=self._ps_max_qlen,
+            kvlen_granularity=_KVLEN_GRANULARITY,
         )
         self._persistent_new_tokens_buffers = {
             "work_metadata": torch.empty(
@@ -226,6 +228,10 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         """
         # max_qlen is Q-side; the kernel uses it to size per-tile workspace.
         max_qlen = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max().item())
+        # max_kvlen drives per-q-tile KV-split bound. For noncausal context
+        # chunks the K side can be much larger than Q (e.g. 8K cached context
+        # per sequence vs ~256-token Q tile), so sizing must account for it.
+        max_kvlen = int((kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).max().item())
         batch_size = seq_lens_cpu.numel()
         num_head_k = self.num_heads
 
@@ -244,6 +250,8 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             num_head_k=num_head_k,
             max_qlen=max_qlen,
             qlen_granularity=_FP8_PREFILL_TILE_Q,
+            max_kvlen=max_kvlen,
+            kvlen_granularity=_KVLEN_GRANULARITY,
         )
 
         if persistent:
