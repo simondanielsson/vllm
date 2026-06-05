@@ -29,11 +29,6 @@ _FP8_PREFILL_TILE_Q = 256
 # K-side tiling granularity required by the PS scheduler.
 _KVLEN_GRANULARITY = 128
 
-# One-shot guard for the layer-0 fingerprint log in _run_kernel.
-_LOGGED_RUN_KERNEL_FINGERPRINT = False
-# One-shot guard for the per-batch snapshot diagnostic log.
-_LOGGED_SNAPSHOT_SIZES = False
-
 
 def _is_fp8_cache_dtype(cache_dtype: str) -> bool:
     return cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
@@ -324,31 +319,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             reduce_partial_map = scratch_reduce_partial_map[
                 :reduce_partial_map_size
             ].clone()
-
-            global _LOGGED_SNAPSHOT_SIZES
-            if not _LOGGED_SNAPSHOT_SIZES and is_causal:
-                assert self._persistent_new_tokens_buffers is not None
-                pb = self._persistent_new_tokens_buffers
-                logger.info(
-                    "AITER_ASM PS snapshot (causal=%s, batch_size=%d, "
-                    "max_qlen=%d): work_indptr %d/%d work_info %d/%d "
-                    "reduce_indptr %d/%d reduce_final_map %d/%d "
-                    "reduce_partial_map %d/%d (snapshot/persistent)",
-                    is_causal,
-                    batch_size,
-                    max_qlen,
-                    work_indptr_size,
-                    pb["work_indptr"].shape[0],
-                    work_info_size[0],
-                    pb["work_info"].shape[0],
-                    reduce_indptr_size,
-                    pb["reduce_indptr"].shape[0],
-                    reduce_final_map_size[0],
-                    pb["reduce_final_map"].shape[0],
-                    reduce_partial_map_size,
-                    pb["reduce_partial_map"].shape[0],
-                )
-                _LOGGED_SNAPSHOT_SIZES = True
         else:
             work_indptr = scratch_work_indptr
             work_info = scratch_work_info
@@ -440,28 +410,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         num_partial_tiles = ps["num_partial_tiles"]
 
         out_dtype = self._prefill_metadata.output_dtype
-
-        global _LOGGED_RUN_KERNEL_FINGERPRINT
-        if not _LOGGED_RUN_KERNEL_FINGERPRINT and is_causal:
-            logger.info(
-                "AITER_ASM _run_kernel fingerprint: "
-                "q.shape=%s q.dtype=%s k.dtype=%s v.dtype=%s "
-                "output_dtype=%s max_q_len=%s num_partial_tiles=%s "
-                "total_q=%s scale=%.6f is_causal=%s "
-                "prefill.max_query_len=%s",
-                tuple(q.shape),
-                q.dtype,
-                k.dtype,
-                v.dtype,
-                out_dtype,
-                ps["max_q_len"],
-                num_partial_tiles,
-                total_q,
-                self.scale,
-                is_causal,
-                getattr(self._prefill_metadata, "max_query_len", None),
-            )
-            _LOGGED_RUN_KERNEL_FINGERPRINT = True
         assert out_dtype is not None
         out = torch.empty(
             (total_q, nhead, v_head_dim),
