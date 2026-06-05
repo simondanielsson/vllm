@@ -11,6 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBackend
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -130,9 +131,25 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._get_ps_metadata_v1 = get_ps_metadata_v1
         self._get_ps_metadata_info_v1 = get_ps_metadata_info_v1
 
+        # Context-chunk (noncausal) attention is delegated to FlashAttention.
+        # The ASM PS kernel produces correct output and LSE in isolation
+        # (verified at op_tests/test_mla_prefill_ps_chunked_context.py) but
+        # the integrated path on real workloads crashes intermittently after
+        # many calls, pointing at workspace-manager / buffer-lifetime issues
+        # outside the kernel. We keep ASM for the new-tokens (causal) chunk,
+        # which is the hottest path, and fall back to FA for context chunks.
+        self._fa_backend = FlashAttnPrefillBackend(
+            num_heads=num_heads,
+            scale=scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            vllm_config=vllm_config,
+        )
+
         # Populated by prepare_metadata before each forward pass.
         self._new_tokens_ps: dict | None = None
-        self._context_ps: list[dict] = []
 
         # Worst-case sizes used to pre-allocate persistent PS buffers for the
         # new-tokens chunk. Mirrors PR #42509: declaring max sizes up-front
@@ -149,6 +166,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
     def _ensure_persistent_buffers(self, device: torch.device) -> None:
         if self._persistent_new_tokens_buffers is not None:
             return
+        # Get max-sized buffers
         (
             (work_metadata_size, work_metadata_dtype),
             (work_indptr_size, work_indptr_dtype),
@@ -369,31 +387,10 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         ps["kv_indices"] = torch.arange(total_q, device=device, dtype=torch.int32)
         self._new_tokens_ps = ps
 
-        # 2. Context chunks (non-causal): K is the chunk's gathered cache (flat,
-        # indexed 0..chunk_total-1), Q is the same new-tokens Q.
-        self._context_ps = []
-        chunked = prefill_metadata.chunked_context
-        if chunked is None:
-            return
-        n_chunks = len(chunked.cu_seq_lens)
-        for i in range(n_chunks):
-            kv_cu_seq_lens = chunked.cu_seq_lens[i]  # device int32 [bs+1]
-            kv_indptr_cpu = kv_cu_seq_lens.to("cpu", dtype=torch.int32)
-            kv_seq_lens_cpu = (kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).to(torch.int32)
-            ps_i = self._build_ps_for_chunk(
-                qo_indptr_cpu=qo_indptr_cpu,
-                kv_indptr_cpu=kv_indptr_cpu,
-                seq_lens_cpu=kv_seq_lens_cpu,
-                is_causal=False,
-                device=device,
-            )
-            chunk_total = int(kv_indptr_cpu[-1].item())
-            ps_i["qo_indptr"] = qo_indptr
-            ps_i["kv_indptr"] = kv_cu_seq_lens
-            ps_i["kv_indices"] = torch.arange(
-                chunk_total, device=device, dtype=torch.int32
-            )
-            self._context_ps.append(ps_i)
+        # 2. Context chunks (non-causal) are delegated to FlashAttention; just
+        # forward the metadata so FA's run_prefill_context_chunk sees the
+        # chunked_context fields on its own _prefill_metadata reference.
+        self._fa_backend.prepare_metadata(prefill_metadata)
 
     def _run_kernel(
         self,
@@ -522,8 +519,4 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert 0 <= chunk_idx < len(self._context_ps), (
-            f"chunk_idx={chunk_idx} out of range; "
-            f"prepare_metadata built {len(self._context_ps)} context chunks"
-        )
-        return self._run_kernel(q, k, v, self._context_ps[chunk_idx], is_causal=False)
+        return self._fa_backend.run_prefill_context_chunk(chunk_idx, q, k, v)
