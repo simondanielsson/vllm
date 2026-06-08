@@ -227,76 +227,26 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         seq_lens_cpu: torch.Tensor,
         is_causal: bool,
         device: torch.device,
-        persistent: bool = False,
     ) -> dict:
-        """Build PS metadata and return a per-batch immutable snapshot.
+        """Build PS metadata in the persistent scratch buffers.
 
         `seq_lens_cpu` drives the PS scheduler's K-side work split. For the
         new-tokens chunk (Q == K) Q-side and K-side lengths are identical.
-        For context chunks we pass K-side per-request lengths.
 
-        When ``persistent=True`` the kernel writes into pre-allocated max-size
-        scratch buffers (zero alloc churn), then the per-batch-sized portions
-        are copied into freshly allocated device tensors that travel with the
-        returned dict. This guarantees the dict is an immutable per-batch
-        snapshot, so future ``prepare_metadata`` calls on the same backend
-        cannot overwrite the buffers a previous in-flight batch is reading.
+        The kernel writes into pre-allocated max-size persistent scratch
+        buffers; the returned dict holds direct references to them. Safe
+        because vLLM serializes build -> forward -> next build on the same
+        stream, so the previous forward's kernels have already been queued
+        (and read the buffers in stream order) before the next build writes.
+        Mirrors the original PR #42509 pattern.
         """
         # max_qlen is Q-side; the kernel uses it to size per-tile workspace.
         max_qlen = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max().item())
-        batch_size = seq_lens_cpu.numel()
         num_head_k = self.num_heads
 
-        # Compute per-batch sizes either way: they tell us how much of the
-        # persistent buffer is valid for this batch, and they size the
-        # snapshot allocations.
-        (
-            (work_metadata_size, work_metadata_dtype),
-            (work_indptr_size, work_indptr_dtype),
-            (work_info_size, work_info_dtype),
-            (reduce_indptr_size, reduce_indptr_dtype),
-            (reduce_final_map_size, reduce_final_map_dtype),
-            (reduce_partial_map_size, reduce_partial_map_dtype),
-        ) = self._get_ps_metadata_info_v1(
-            batch_size=batch_size,
-            num_head_k=num_head_k,
-            max_qlen=max_qlen,
-            qlen_granularity=_FP8_PREFILL_TILE_Q,
-        )
-
-        if persistent:
-            self._ensure_persistent_buffers(device)
-            assert self._persistent_new_tokens_buffers is not None
-            buffers = self._persistent_new_tokens_buffers
-            scratch_work_metadata = buffers["work_metadata"]
-            scratch_work_indptr = buffers["work_indptr"]
-            scratch_work_info = buffers["work_info"]
-            scratch_reduce_indptr = buffers["reduce_indptr"]
-            scratch_reduce_final_map = buffers["reduce_final_map"]
-            scratch_reduce_partial_map = buffers["reduce_partial_map"]
-        else:
-            scratch_work_metadata = torch.empty(
-                work_metadata_size, dtype=work_metadata_dtype, device=device
-            )
-            scratch_work_indptr = torch.empty(
-                work_indptr_size, dtype=work_indptr_dtype, device=device
-            )
-            scratch_work_info = torch.empty(
-                *work_info_size, dtype=work_info_dtype, device=device
-            )
-            scratch_reduce_indptr = torch.empty(
-                reduce_indptr_size, dtype=reduce_indptr_dtype, device=device
-            )
-            scratch_reduce_final_map = torch.empty(
-                *reduce_final_map_size,
-                dtype=reduce_final_map_dtype,
-                device=device,
-            )
-            scratch_reduce_partial_map = torch.empty(
-                reduce_partial_map_size,
-                dtype=reduce_partial_map_dtype,
-                device=device,
-            )
+        self._ensure_persistent_buffers(device)
+        assert self._persistent_new_tokens_buffers is not None
+        buffers = self._persistent_new_tokens_buffers
 
         self._get_ps_metadata_v1(
             qo_indptr_cpu,
@@ -304,12 +254,12 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             seq_lens_cpu,
             1,  # gqa_ratio: K is decompressed to num_heads, matching Q.
             num_head_k,
-            scratch_work_metadata,
-            scratch_work_indptr,
-            scratch_work_info,
-            scratch_reduce_indptr,
-            scratch_reduce_final_map,
-            scratch_reduce_partial_map,
+            buffers["work_metadata"],
+            buffers["work_indptr"],
+            buffers["work_info"],
+            buffers["reduce_indptr"],
+            buffers["reduce_final_map"],
+            buffers["reduce_partial_map"],
             qhead_granularity=1,
             qlen_granularity=_FP8_PREFILL_TILE_Q,
             kvlen_granularity=_KVLEN_GRANULARITY,
@@ -319,37 +269,16 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
         # reduce_indptr[-1] counts the K-split partial tiles emitted by the
         # PS scheduler; it sizes the per-call scratch for the kernel pair.
-        # Reading it here forces one host sync per chunk per batch — fine at
-        # build time, would break CUDA Graph capture if done in forward.
-        num_partial_tiles = int(scratch_reduce_indptr[-1].item())
-
-        if persistent:
-            # Snapshot: clone exactly the per-batch valid slice of each
-            # buffer into fresh device tensors. The kernel will read these
-            # (not the shared persistent ones), so a future build() on this
-            # backend can't corrupt an in-flight forward.
-            work_indptr = scratch_work_indptr[:work_indptr_size].clone()
-            work_info = scratch_work_info[: work_info_size[0]].clone()
-            reduce_indptr = scratch_reduce_indptr[:reduce_indptr_size].clone()
-            reduce_final_map = scratch_reduce_final_map[
-                : reduce_final_map_size[0]
-            ].clone()
-            reduce_partial_map = scratch_reduce_partial_map[
-                :reduce_partial_map_size
-            ].clone()
-        else:
-            work_indptr = scratch_work_indptr
-            work_info = scratch_work_info
-            reduce_indptr = scratch_reduce_indptr
-            reduce_final_map = scratch_reduce_final_map
-            reduce_partial_map = scratch_reduce_partial_map
+        # Reading it here forces one host sync per build, fine at build
+        # time, would break CUDA Graph capture if done in forward.
+        num_partial_tiles = int(buffers["reduce_indptr"][-1].item())
 
         return {
-            "work_indptr": work_indptr,
-            "work_info": work_info,
-            "reduce_indptr": reduce_indptr,
-            "reduce_final_map": reduce_final_map,
-            "reduce_partial_map": reduce_partial_map,
+            "work_indptr": buffers["work_indptr"],
+            "work_info": buffers["work_info"],
+            "reduce_indptr": buffers["reduce_indptr"],
+            "reduce_final_map": buffers["reduce_final_map"],
+            "reduce_partial_map": buffers["reduce_partial_map"],
             "num_partial_tiles": num_partial_tiles,
             "max_q_len": max_qlen,
         }
@@ -371,7 +300,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             seq_lens_cpu=q_seq_lens_cpu,
             is_causal=True,
             device=device,
-            persistent=True,
         )
         total_q = int(qo_indptr_cpu[-1].item())
         ps["qo_indptr"] = qo_indptr
