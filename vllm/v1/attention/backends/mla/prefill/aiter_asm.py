@@ -131,13 +131,8 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._get_ps_metadata_v1 = get_ps_metadata_v1
         self._get_ps_metadata_info_v1 = get_ps_metadata_info_v1
 
-        # Context-chunk (noncausal) attention is delegated to FlashAttention.
-        # The ASM PS kernel produces correct output and LSE in isolation
-        # (verified at op_tests/test_mla_prefill_ps_chunked_context.py) but
-        # the integrated path on real workloads crashes intermittently after
-        # many calls, pointing at workspace-manager / buffer-lifetime issues
-        # outside the kernel. We keep ASM for the new-tokens (causal) chunk,
-        # which is the hottest path, and fall back to FA for context chunks.
+        # TODO(simondanielsson): remove FA backend fallback for chunked context once
+        # the PS ASM kernel returns correct LSE's.
         self._fa_backend = FlashAttnPrefillBackend(
             num_heads=num_heads,
             scale=scale,
@@ -152,9 +147,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._new_tokens_ps: dict | None = None
 
         # Worst-case sizes used to pre-allocate persistent PS buffers for the
-        # new-tokens chunk. Mirrors PR #42509: declaring max sizes up-front
-        # changes the PS scheduler's K-split layout vs allocating with exact
-        # per-batch sizes, which empirically affected gsm8k accuracy.
+        # new-tokens chunk.
         self._ps_max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self._ps_max_qlen = min(
             vllm_config.model_config.max_model_len,
@@ -381,9 +374,8 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             final_lse,
         )
 
-        # AITER mla_reduce_v1 writes final_lse as (total_q, num_heads).
-        # vLLM's merge_attn_states and the FA-based MLA paths expect
-        # (num_heads, total_q), so transpose to match the contract.
+        # AITER mla_reduce_v1 writes final_lse as (total_q, num_heads)
+        # but merge_attn_states and the FA-based MLA paths expect (num_heads, total_q)
         return out, final_lse.transpose(0, 1).contiguous()
 
     def run_prefill_new_tokens(
@@ -408,4 +400,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fall back to FA because the PS ASM kernel currently produces incorrect LSE's
+        # for non-causal chunks
         return self._fa_backend.run_prefill_context_chunk(chunk_idx, q, k, v)
