@@ -408,14 +408,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
         out_dtype = self._prefill_metadata.output_dtype
         assert out_dtype is not None
-        # Pre-zero out and pre-fill final_lse with -inf so any token the PS
-        # scheduler does not assign work for (e.g. q-tiles whose context-chunk
-        # kv length is 0 in the noncausal path) lands as a safe sentinel:
-        # out = 0 contributes nothing, final_lse = -inf weights this branch to
-        # zero in merge_attn_states (the chunked-context merge then attributes
-        # 100% weight to the other branch, which is exactly the correct
-        # behavior for "this tile has no KV in this chunk").
-        out = torch.zeros(
+        out = torch.empty(
             (total_q, nhead, v_head_dim),
             dtype=out_dtype,
             device=q.device,
@@ -428,7 +421,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             ((num_partial_tiles * tile_q, nhead), torch.float32),
             ((total_q, nhead), torch.float32),
         )
-        final_lse.fill_(float("-inf"))
 
         self._mla_prefill_ps_asm_fwd(
             q,
