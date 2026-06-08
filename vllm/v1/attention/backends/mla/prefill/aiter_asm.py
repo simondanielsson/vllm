@@ -381,29 +381,6 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             final_lse,
         )
 
-        import os
-
-        if os.environ.get("VLLM_PROBE_AITER_REDUCE_COVERAGE", "0") == "1":
-            with torch.no_grad():
-                rindptr = ps["reduce_indptr"].to("cpu")
-                rfmap = ps["reduce_final_map"].to("cpu")
-                deltas = rindptr[1:] - rindptr[:-1]
-                valid_mask = deltas > 0
-                num_valid = int(valid_mask.sum().item())
-                if num_valid > 0:
-                    fm = rfmap[:num_valid].view(-1, 2)
-                    covered = int((fm[:, 1] - fm[:, 0]).sum().item())
-                else:
-                    covered = 0
-                frac = covered / max(total_q, 1)
-                print(
-                    f"[AITER_REDUCE_COVERAGE] is_causal={is_causal} "
-                    f"total_q={total_q} covered={covered} frac={frac:.4f} "
-                    f"num_final_entries={num_valid} "
-                    f"num_partial_tiles={num_partial_tiles}",
-                    flush=True,
-                )
-
         # AITER mla_reduce_v1 writes final_lse as (total_q, num_heads).
         # vLLM's merge_attn_states and the FA-based MLA paths expect
         # (num_heads, total_q), so transpose to match the contract.
