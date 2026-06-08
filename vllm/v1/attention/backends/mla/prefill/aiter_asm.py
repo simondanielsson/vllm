@@ -139,6 +139,22 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             vllm_config.model_config.max_model_len,
             vllm_config.scheduler_config.max_num_batched_tokens,
         )
+        # Worst-case K length for a context chunk per sequence. Bounded by
+        # the chunked-prefill workspace size, since the scheduler sets
+        # max_context_chunk = chunked_prefill_workspace_size //
+        # num_prefills_with_context (1 in the worst case). Needed by AITER
+        # PS scheduler to size noncausal context-chunk work buffers; without
+        # it, the PS metadata is sized for causal-only (max_kvlen ==
+        # max_qlen) and can under-allocate work slots for long contexts.
+        from vllm.model_executor.layers.attention.mla_attention import (
+            MLACommonMetadataBuilder,
+        )
+
+        self._ps_max_context_kvlen = (
+            MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                vllm_config
+            )
+        )
         # Lazy init on first prepare_metadata / run_prefill_context_chunk call
         # (need device). Separate buffer sets for the two chunk kinds: the
         # new-tokens dict is built once in prepare_metadata and consumed later
@@ -160,7 +176,11 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         existing = getattr(self, attr)
         if existing is not None:
             return existing
-        # Get max-sized buffers
+        # Noncausal context chunks need max_kvlen passed explicitly so the PS
+        # scheduler sizes per-q-tile KV-split slots correctly. Causal new-
+        # tokens chunks have K == Q per sequence; the default (max_kvlen
+        # falls back to max_qlen) is correct.
+        max_kvlen = self._ps_max_context_kvlen if kind == "context" else None
         (
             (work_metadata_size, work_metadata_dtype),
             (work_indptr_size, work_indptr_dtype),
@@ -173,6 +193,8 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             num_head_k=self.num_heads,
             max_qlen=self._ps_max_qlen,
             qlen_granularity=_FP8_PREFILL_TILE_Q,
+            max_kvlen=max_kvlen,
+            kvlen_granularity=_KVLEN_GRANULARITY,
         )
         buffers = {
             "work_metadata": torch.empty(
