@@ -500,6 +500,11 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         """
         from vllm.v1.worker.workspace import current_workspace_manager
 
+        # AITER ASM kernel requires V contiguous in (seq, head, v_head_dim).
+        # cp_gather_cache produces V as a slice of a wider nope+rope buffer
+        # (stride[1] = qk_head_dim, not v_head_dim), so force a copy here.
+        v = v.contiguous()
+
         total_q = q.shape[0]
         nhead = self.num_heads
         v_head_dim = self.v_head_dim
