@@ -142,15 +142,17 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         #
         # AITER's get_ps_metadata_info_v1 sizes work buffers as
         # qo_tile_cnt = batch_size * ceil(max_qlen / qlen_granularity).
-        # The naive bound batch_size=max_num_seqs (1024 for DSV3) gives
-        # ~32K tiles, ~1000x larger than reality: the actual ceiling on
-        # total Q tiles a single forward pass can produce is bounded by
-        # max_num_batched_tokens / qlen_granularity (since total Q across
-        # the batch is bounded by max_num_batched_tokens). So pass
-        # batch_size=1, max_qlen=max_num_batched_tokens to size for the
-        # correct upper bound on total Q work tiles.
-        self._ps_max_num_reqs = 1
-        self._ps_max_qlen = vllm_config.scheduler_config.max_num_batched_tokens
+        # The actual ceiling on total Q tiles a forward pass can produce is
+        # max(B, total_Q / qlen_granularity + B), since (a) each request
+        # always contributes at least one boundary partial tile and
+        # (b) total Q across the batch is bounded by max_num_batched_tokens.
+        # Passing batch_size=max_num_seqs, max_qlen=qlen_granularity gives
+        # qo_tile_cnt = max_num_seqs, which dominates both terms for typical
+        # configs (max_num_seqs >= max_num_batched_tokens / qlen_granularity).
+        # The naive bound batch_size=max_num_seqs, max_qlen=max_num_batched_tokens
+        # over-provisions by ~32x for no benefit.
+        self._ps_max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self._ps_max_qlen = _FP8_PREFILL_TILE_Q
         # Worst-case K length for a context chunk per sequence. Bounded by
         # the chunked-prefill workspace size, since the scheduler sets
         # max_context_chunk = chunked_prefill_workspace_size //
