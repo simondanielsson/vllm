@@ -30,10 +30,6 @@ _FP8_PREFILL_TILE_Q = 256
 _KVLEN_GRANULARITY = 128
 
 
-def _is_fp8_cache_dtype(cache_dtype: str) -> bool:
-    return cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
-
-
 class AiterAsmPrefillBackend(MLAPrefillBackend):
     """FP8 MLA prefill backend built on AITER persistent-scheduling ASM on gfx950.
 
