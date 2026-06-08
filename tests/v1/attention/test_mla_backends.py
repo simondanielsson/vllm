@@ -783,7 +783,11 @@ def test_backend_correctness(
     try:
         prefill_invalid_reasons = prefill_backend.get_class().validate_configuration(
             current_platform.get_device_capability(),
-            MLAPrefillSelectorConfig(dtype=torch.bfloat16, is_r1_compatible=True),
+            MLAPrefillSelectorConfig(
+                dtype=torch.bfloat16,
+                is_r1_compatible=True,
+                cache_dtype=kv_cache_dtype,
+            ),
         )
     except ImportError:
         prefill_invalid_reasons = ["ImportError"]
