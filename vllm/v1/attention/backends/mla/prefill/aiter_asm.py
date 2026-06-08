@@ -50,6 +50,15 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
     # parent regardless of attention_config.use_prefill_query_quantization.
     requires_fp8_query_quantization = True
 
+    # Process-wide singleton caches keyed by (device, num_heads, max_num_reqs,
+    # max_qlen, max_kvlen, kind). MLA backends are instantiated once per layer
+    # (~30 per rank for DSV3), but the persistent PS scratch buffers depend
+    # only on shape constants known at construction time. Sharing across all
+    # layer instances drops allocation from ~30x to 1x per rank and similarly
+    # gates the noncausal JIT warmup so it runs only once per rank.
+    _SHARED_BUFFERS: dict[tuple, dict] = {}
+    _WARMUP_DONE: set[tuple] = set()
+
     @staticmethod
     def get_name() -> str:
         return "AITER_ASM"
@@ -130,11 +139,18 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._new_tokens_ps: dict | None = None
 
         # Worst-case sizes used to pre-allocate persistent PS buffers.
-        self._ps_max_num_reqs = vllm_config.scheduler_config.max_num_seqs
-        self._ps_max_qlen = min(
-            vllm_config.model_config.max_model_len,
-            vllm_config.scheduler_config.max_num_batched_tokens,
-        )
+        #
+        # AITER's get_ps_metadata_info_v1 sizes work buffers as
+        # qo_tile_cnt = batch_size * ceil(max_qlen / qlen_granularity).
+        # The naive bound batch_size=max_num_seqs (1024 for DSV3) gives
+        # ~32K tiles, ~1000x larger than reality: the actual ceiling on
+        # total Q tiles a single forward pass can produce is bounded by
+        # max_num_batched_tokens / qlen_granularity (since total Q across
+        # the batch is bounded by max_num_batched_tokens). So pass
+        # batch_size=1, max_qlen=max_num_batched_tokens to size for the
+        # correct upper bound on total Q work tiles.
+        self._ps_max_num_reqs = 1
+        self._ps_max_qlen = vllm_config.scheduler_config.max_num_batched_tokens
         # Worst-case K length for a context chunk per sequence. Bounded by
         # the chunked-prefill workspace size, since the scheduler sets
         # max_context_chunk = chunked_prefill_workspace_size //
@@ -151,15 +167,15 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
                 vllm_config
             )
         )
-        # Lazy init on first prepare_metadata / run_prefill_context_chunk call
-        # (need device). Separate buffer sets for the two chunk kinds: the
-        # new-tokens dict is built once in prepare_metadata and consumed later
-        # by run_prefill_new_tokens, while context chunks build and consume
-        # within run_prefill_context_chunk. Sharing one buffer set would let
-        # the context loop overwrite the new-tokens PS metadata before the
-        # new-tokens kernel reads it.
-        self._persistent_new_tokens_buffers: dict | None = None
-        self._persistent_context_buffers: dict | None = None
+        # Persistent buffers are looked up from the class-level _SHARED_BUFFERS
+        # cache the first time prepare_metadata / run_prefill_context_chunk
+        # runs (when we have a device). Two separate buffer sets exist per
+        # rank, one for the new-tokens chunk and one shared across context
+        # chunks: the new-tokens dict is built once in prepare_metadata and
+        # consumed later by run_prefill_new_tokens, while context chunks
+        # build and consume within run_prefill_context_chunk. Sharing one
+        # buffer set would let the context loop overwrite the new-tokens PS
+        # metadata before the new-tokens kernel reads it.
 
         # JIT-compile the noncausal PS ASM kernel now, before any real request
         # can hit it. vLLM's profile_run builds a pure-prefill batch with
@@ -168,11 +184,17 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         # variant otherwise compiles on the first chunked-context request,
         # stalling all TP ranks at the next collective long enough to trigger
         # shm_broadcast timeouts. We skip the causal warmup because
-        # profile_run already covers it.
+        # profile_run already covers it. Class-level gating means only the
+        # first MLA layer instance runs the warmup per rank.
         self._warmup_noncausal()
 
     def _warmup_noncausal(self) -> None:
-        """One synthetic launch of the noncausal PS ASM kernel pair."""
+        """One synthetic launch of the noncausal PS ASM kernel pair.
+
+        Class-gated so only the first AiterAsmPrefillBackend instance on a
+        given (device, config) pair actually fires the kernel; subsequent
+        layer-level instantiations short-circuit.
+        """
         if not torch.accelerator.is_available():
             return
         try:
@@ -183,6 +205,16 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
         device = torch.accelerator.current_accelerator()
         assert device is not None
+        warmup_key = (
+            str(device),
+            self.num_heads,
+            self._ps_max_num_reqs,
+            self._ps_max_qlen,
+            self._ps_max_context_kvlen,
+        )
+        if warmup_key in type(self)._WARMUP_DONE:
+            return
+        type(self)._WARMUP_DONE.add(warmup_key)
         fp8_dtype = current_platform.fp8_dtype()
 
         nhead = self.num_heads
@@ -276,16 +308,27 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         ``kind`` is ``"new_tokens"`` or ``"context"``. Two independent buffer
         sets exist so the context-chunk loop never overwrites new-tokens
         metadata that ``run_prefill_new_tokens`` still needs.
+
+        Buffers live in the class-level ``_SHARED_BUFFERS`` cache keyed by
+        (device, num_heads, max_num_reqs, max_qlen, max_kvlen, kind) so all
+        layer instances on the same rank share one allocation per kind.
         """
-        attr = f"_persistent_{kind}_buffers"
-        existing = getattr(self, attr)
-        if existing is not None:
-            return existing
         # Noncausal context chunks need max_kvlen passed explicitly so the PS
         # scheduler sizes per-q-tile KV-split slots correctly. Causal new-
         # tokens chunks have K == Q per sequence; the default (max_kvlen
         # falls back to max_qlen) is correct.
         max_kvlen = self._ps_max_context_kvlen if kind == "context" else None
+        cache_key = (
+            str(device),
+            self.num_heads,
+            self._ps_max_num_reqs,
+            self._ps_max_qlen,
+            max_kvlen,
+            kind,
+        )
+        cached = type(self)._SHARED_BUFFERS.get(cache_key)
+        if cached is not None:
+            return cached
         (
             (work_metadata_size, work_metadata_dtype),
             (work_indptr_size, work_indptr_dtype),
@@ -325,7 +368,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
                 device=device,
             ),
         }
-        setattr(self, attr, buffers)
+        type(self)._SHARED_BUFFERS[cache_key] = buffers
         logger.info(
             "AITER_ASM persistent PS buffers allocated (kind=%s, "
             "max_num_reqs=%d, max_qlen=%d, num_head_k=%d) "
