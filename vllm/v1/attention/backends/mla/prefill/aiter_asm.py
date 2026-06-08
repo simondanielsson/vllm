@@ -11,7 +11,6 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
-from vllm.v1.attention.backends.mla.prefill.flash_attn import FlashAttnPrefillBackend
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -131,34 +130,36 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._get_ps_metadata_v1 = get_ps_metadata_v1
         self._get_ps_metadata_info_v1 = get_ps_metadata_info_v1
 
-        # TODO(simondanielsson): remove FA backend fallback for chunked context once
-        # the PS ASM kernel returns correct LSE's.
-        self._fa_backend = FlashAttnPrefillBackend(
-            num_heads=num_heads,
-            scale=scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            vllm_config=vllm_config,
-        )
-
         # Populated by prepare_metadata before each forward pass.
         self._new_tokens_ps: dict | None = None
 
-        # Worst-case sizes used to pre-allocate persistent PS buffers for the
-        # new-tokens chunk.
+        # Worst-case sizes used to pre-allocate persistent PS buffers.
         self._ps_max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self._ps_max_qlen = min(
             vllm_config.model_config.max_model_len,
             vllm_config.scheduler_config.max_num_batched_tokens,
         )
-        # Lazy init on first prepare_metadata call (need device).
+        # Lazy init on first prepare_metadata / run_prefill_context_chunk call
+        # (need device). Separate buffer sets for the two chunk kinds: the
+        # new-tokens dict is built once in prepare_metadata and consumed later
+        # by run_prefill_new_tokens, while context chunks build and consume
+        # within run_prefill_context_chunk. Sharing one buffer set would let
+        # the context loop overwrite the new-tokens PS metadata before the
+        # new-tokens kernel reads it.
         self._persistent_new_tokens_buffers: dict | None = None
+        self._persistent_context_buffers: dict | None = None
 
-    def _ensure_persistent_buffers(self, device: torch.device) -> None:
-        if self._persistent_new_tokens_buffers is not None:
-            return
+    def _ensure_persistent_buffers(self, device: torch.device, kind: str) -> dict:
+        """Lazily allocate max-size PS scratch buffers for one chunk kind.
+
+        ``kind`` is ``"new_tokens"`` or ``"context"``. Two independent buffer
+        sets exist so the context-chunk loop never overwrites new-tokens
+        metadata that ``run_prefill_new_tokens`` still needs.
+        """
+        attr = f"_persistent_{kind}_buffers"
+        existing = getattr(self, attr)
+        if existing is not None:
+            return existing
         # Get max-sized buffers
         (
             (work_metadata_size, work_metadata_dtype),
@@ -173,7 +174,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             max_qlen=self._ps_max_qlen,
             qlen_granularity=_FP8_PREFILL_TILE_Q,
         )
-        self._persistent_new_tokens_buffers = {
+        buffers = {
             "work_metadata": torch.empty(
                 work_metadata_size, dtype=work_metadata_dtype, device=device
             ),
@@ -197,11 +198,13 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
                 device=device,
             ),
         }
+        setattr(self, attr, buffers)
         logger.info(
-            "AITER_ASM persistent PS buffers allocated "
-            "(max_num_reqs=%d, max_qlen=%d, num_head_k=%d) "
+            "AITER_ASM persistent PS buffers allocated (kind=%s, "
+            "max_num_reqs=%d, max_qlen=%d, num_head_k=%d) "
             "work_metadata=%s work_indptr=%s work_info=%s "
             "reduce_indptr=%s reduce_final_map=%s reduce_partial_map=%s",
+            kind,
             self._ps_max_num_reqs,
             self._ps_max_qlen,
             self.num_heads,
@@ -212,6 +215,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             tuple(reduce_final_map_size),
             reduce_partial_map_size,
         )
+        return buffers
 
     def _build_ps_for_chunk(
         self,
@@ -220,11 +224,14 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         seq_lens_cpu: torch.Tensor,
         is_causal: bool,
         device: torch.device,
+        kind: str,
     ) -> dict:
-        """Build PS metadata in the persistent scratch buffers.
+        """Build PS metadata in the persistent scratch buffers of one kind.
 
-        `seq_lens_cpu` drives the PS scheduler's K-side work split. For the
-        new-tokens chunk (Q == K) Q-side and K-side lengths are identical.
+        ``kind`` is ``"new_tokens"`` or ``"context"``; selects which
+        persistent buffer set to write into. ``seq_lens_cpu`` drives the PS
+        scheduler's K-side work split. For the new-tokens chunk (Q == K)
+        Q-side and K-side lengths are identical.
 
         The kernel writes into pre-allocated max-size persistent scratch
         buffers; the returned dict holds direct references to them. Safe
@@ -237,9 +244,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         max_qlen = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max().item())
         num_head_k = self.num_heads
 
-        self._ensure_persistent_buffers(device)
-        assert self._persistent_new_tokens_buffers is not None
-        buffers = self._persistent_new_tokens_buffers
+        buffers = self._ensure_persistent_buffers(device, kind)
 
         self._get_ps_metadata_v1(
             qo_indptr_cpu,
@@ -286,13 +291,16 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
         q_seq_lens_cpu = (qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).to(torch.int32)
 
-        # 1. New-tokens chunk (causal): K == Q.
+        # New-tokens chunk (causal): K == Q. Context chunks are built
+        # on-the-fly inside run_prefill_context_chunk; they share the context
+        # buffer set and consume it before the next chunk builds over it.
         ps = self._build_ps_for_chunk(
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=qo_indptr_cpu,
             seq_lens_cpu=q_seq_lens_cpu,
             is_causal=True,
             device=device,
+            kind="new_tokens",
         )
         total_q = int(qo_indptr_cpu[-1].item())
         ps["qo_indptr"] = qo_indptr
@@ -300,10 +308,9 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         ps["kv_indices"] = torch.arange(total_q, device=device, dtype=torch.int32)
         self._new_tokens_ps = ps
 
-        # 2. Context chunks (non-causal) are delegated to FlashAttention; just
-        # forward the metadata so FA's run_prefill_context_chunk sees the
-        # chunked_context fields on its own _prefill_metadata reference.
-        self._fa_backend.prepare_metadata(prefill_metadata)
+        # Stash Q-side metadata for run_prefill_context_chunk to reuse.
+        self._qo_indptr = qo_indptr
+        self._qo_indptr_cpu = qo_indptr_cpu
 
     def _run_kernel(
         self,
@@ -400,6 +407,35 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Fall back to FA because the PS ASM kernel currently produces incorrect LSE's
-        # for non-causal chunks
-        return self._fa_backend.run_prefill_context_chunk(chunk_idx, q, k, v)
+        """Non-causal ASM prefill over one cached-context chunk.
+
+        Q is the full new-tokens query (same across chunks). K/V are the
+        chunk's cached context, already loaded into contiguous tensors by
+        the parent ``_compute_prefill_context`` loop. Per-chunk PS metadata
+        is built into the shared context buffer set; sequential chunk
+        execution on the default stream means the previous chunk's kernels
+        have already read the buffer before the next chunk overwrites it.
+        """
+        assert self._prefill_metadata.chunked_context is not None
+        cc = self._prefill_metadata.chunked_context
+
+        # K-side cu_seq_lens for this chunk (device int32 [bs+1]); pull to
+        # CPU for the PS metadata builder (host-side).
+        kv_indptr = cc.cu_seq_lens[chunk_idx]
+        kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
+        k_seq_lens_cpu = (kv_indptr_cpu[1:] - kv_indptr_cpu[:-1]).to(torch.int32)
+
+        ps = self._build_ps_for_chunk(
+            qo_indptr_cpu=self._qo_indptr_cpu,
+            kv_indptr_cpu=kv_indptr_cpu,
+            seq_lens_cpu=k_seq_lens_cpu,
+            is_causal=False,
+            device=q.device,
+            kind="context",
+        )
+        total_k = int(kv_indptr_cpu[-1].item())
+        ps["qo_indptr"] = self._qo_indptr
+        ps["kv_indptr"] = kv_indptr
+        ps["kv_indices"] = torch.arange(total_k, device=q.device, dtype=torch.int32)
+
+        return self._run_kernel(q, k, v, ps, is_causal=False)
