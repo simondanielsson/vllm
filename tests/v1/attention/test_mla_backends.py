@@ -804,9 +804,7 @@ def test_backend_correctness(
     if prefill_backend == MLAPrefillBackendEnum.AITER_ASM and (
         q_scale != 1.0 or k_scale != 1.0
     ):
-        pytest.skip(
-            "AITER_ASM MLA prefill backend only supports q_scale==k_scale==1.0"
-        )
+        pytest.skip("AITER_ASM MLA prefill backend only supports q_scale==k_scale==1.0")
 
     batch_spec = BATCH_SPECS[batch_spec_name]
     is_spec_decode_test = batch_spec_name.startswith("spec_decode")
