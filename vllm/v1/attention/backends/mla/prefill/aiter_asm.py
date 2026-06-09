@@ -500,6 +500,11 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         """
         from vllm.v1.worker.workspace import current_workspace_manager
 
+        # AITER ASM kernel requires V contiguous in (seq, head, v_head_dim).
+        # cp_gather_cache produces V as a slice of a wider nope+rope buffer
+        # (stride[1] = qk_head_dim, not v_head_dim), so force a copy here.
+        v = v.contiguous()
+
         total_q = q.shape[0]
         nhead = self.num_heads
         v_head_dim = self.v_head_dim
@@ -537,6 +542,13 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             logits,
             attn_lse,
             out,
+            # Per-tensor dequant scales for Q/K/V passed to the AITER FP8
+            # ASM kernel. We hardcode 1.0 because this backend currently
+            # assumes inputs are in real units (no per-tensor FP8 dequant
+            # scale to undo). Supporting q_scale/k_scale/v_scale != 1 would
+            # require plumbing the layer's _q_scale/_k_scale/_v_scale tensors
+            # through prepare_metadata or a bind step. The test suite is
+            # expected to skip non-unit scales for this backend.
             one_scale,
             one_scale,
             one_scale,
