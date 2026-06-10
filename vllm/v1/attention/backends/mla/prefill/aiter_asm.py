@@ -169,6 +169,12 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
                 vllm_config
             )
         )
+        # total_q in _run_kernel (the summed new-tokens Q over the batch) is
+        # bounded by the per-batch token budget, used to size the final_lse
+        # scratch reserved below.
+        self._ps_max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         # Persistent buffers are looked up from the class-level _SHARED_BUFFERS
         # cache the first time prepare_metadata / run_prefill_context_chunk
         # runs (when we have a device). Two separate buffer sets exist per
@@ -189,6 +195,72 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         # profile_run already covers it. Class-level gating means only the
         # first MLA layer instance runs the warmup per rank.
         self._warmup_noncausal()
+
+        # Reserve the per-call forward scratch (logits/attn_lse/final_lse)
+        # before the global workspace manager is locked after warmup. The
+        # forward path (_run_kernel) requests this scratch lazily, which would
+        # otherwise be the first request after lock and trip the
+        # "Workspace growth is not allowed after locking" assertion.
+        self._reserve_forward_workspace()
+
+    def _reserve_forward_workspace(self) -> None:
+        """Reserve max-size forward scratch before workspace lock.
+
+        ``_run_kernel`` requests three scratch tensors per call from the global
+        workspace manager:
+
+            logits:    (num_partial_tiles * tile_q, num_heads, v_head_dim) f32
+            attn_lse:  (num_partial_tiles * tile_q, num_heads)             f32
+            final_lse: (total_q, num_heads)                                f32
+
+        ``num_partial_tiles`` at runtime is ``reduce_indptr[-1]``, bounded by
+        the PS metadata capacity ``reduce_partial_map_size``; ``total_q`` is
+        the summed new-tokens Q over the batch, bounded by
+        ``max_num_batched_tokens``. The worst case is taken across both chunk
+        kinds (new-tokens and context) since each sizes its PS metadata
+        independently. Reserving here, before ``lock_workspace()``, grows the
+        workspace to the max so no post-lock growth is needed.
+        """
+        if not torch.accelerator.is_available():
+            return
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        if not is_workspace_manager_initialized():
+            return
+
+        device = torch.accelerator.current_accelerator()
+        assert device is not None
+
+        nhead = self.num_heads
+        v_head_dim = self.v_head_dim
+        tile_q = _FP8_PREFILL_TILE_Q
+
+        max_partial_tiles = 0
+        for kind in ("new_tokens", "context"):
+            buffers = self._ensure_persistent_buffers(device, kind)
+            max_partial_tiles = max(
+                max_partial_tiles, buffers["reduce_partial_map"].numel()
+            )
+
+        max_total_q = self._ps_max_num_batched_tokens
+        current_workspace_manager().get_simultaneous(
+            ((max_partial_tiles * tile_q, nhead, v_head_dim), torch.float32),
+            ((max_partial_tiles * tile_q, nhead), torch.float32),
+            ((max_total_q, nhead), torch.float32),
+        )
+        logger.info(
+            "AITER_ASM forward scratch reserved "
+            "(max_partial_tiles=%d, tile_q=%d, num_heads=%d, v_head_dim=%d, "
+            "max_total_q=%d)",
+            max_partial_tiles,
+            tile_q,
+            nhead,
+            v_head_dim,
+            max_total_q,
+        )
 
     def _warmup_noncausal(self) -> None:
         """One synthetic launch of the noncausal PS ASM kernel pair.
