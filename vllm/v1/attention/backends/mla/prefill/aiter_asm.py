@@ -418,6 +418,89 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
 
         buffers = self._ensure_persistent_buffers(device, kind)
 
+        # TEMPORARY DIAGNOSTIC: the shared PS buffers are sized once by
+        # _ensure_persistent_buffers with the WORST-CASE info geometry
+        # (batch=max_num_seqs, max_qlen=_ps_max_qlen=256, max_kvlen=workspace).
+        # But get_ps_metadata_v1 below fills them from the ACTUAL chunk
+        # geometry, whose max_qlen (e.g. 1121 -> 5 q-tiles/req) and batch can
+        # differ. If the actual geometry needs more entries than were
+        # allocated, the C++ builder writes OOB into these shared buffers and
+        # poisons a neighbor allocation (the observed MAF). Recompute the info
+        # sizes for the real geometry and assert each allocated buffer covers
+        # it, BEFORE the fill. Remove once confirmed.
+        actual_batch = qo_indptr_cpu.numel() - 1
+        actual_max_kvlen = int(seq_lens_cpu.max().item()) if not is_causal else None
+        (
+            (a_work_metadata_size, _),
+            (a_work_indptr_size, _),
+            (a_work_info_size, _),
+            (a_reduce_indptr_size, _),
+            (a_reduce_final_map_size, _),
+            (a_reduce_partial_map_size, _),
+        ) = self._get_ps_metadata_info_v1(
+            batch_size=actual_batch,
+            num_head_k=num_head_k,
+            max_qlen=max_qlen,
+            qlen_granularity=_FP8_PREFILL_TILE_Q,
+            max_kvlen=actual_max_kvlen,
+            kvlen_granularity=_KVLEN_GRANULARITY,
+        )
+        logger.info(
+            "PSBUF_DBG kind=%s causal=%s actual_batch=%d actual_max_qlen=%d "
+            "actual_max_kvlen=%s | alloc(work_meta=%d work_indptr=%d "
+            "work_info=%s reduce_indptr=%d reduce_final_map=%s "
+            "reduce_partial_map=%d) | need(work_meta=%d work_indptr=%d "
+            "work_info=%s reduce_indptr=%d reduce_final_map=%s "
+            "reduce_partial_map=%d)",
+            kind,
+            is_causal,
+            actual_batch,
+            max_qlen,
+            actual_max_kvlen,
+            buffers["work_metadata"].numel(),
+            buffers["work_indptr"].numel(),
+            tuple(buffers["work_info"].shape),
+            buffers["reduce_indptr"].numel(),
+            tuple(buffers["reduce_final_map"].shape),
+            buffers["reduce_partial_map"].numel(),
+            a_work_metadata_size,
+            a_work_indptr_size,
+            tuple(a_work_info_size),
+            a_reduce_indptr_size,
+            tuple(a_reduce_final_map_size),
+            a_reduce_partial_map_size,
+        )
+        assert buffers["work_indptr"].numel() >= a_work_indptr_size, (
+            f"work_indptr alloc={buffers['work_indptr'].numel()} < "
+            f"need={a_work_indptr_size} (kind={kind}, causal={is_causal}, "
+            f"batch={actual_batch}, max_qlen={max_qlen}, "
+            f"max_kvlen={actual_max_kvlen})"
+        )
+        assert buffers["work_info"].shape[0] >= a_work_info_size[0], (
+            f"work_info rows alloc={buffers['work_info'].shape[0]} < "
+            f"need={a_work_info_size[0]} (kind={kind}, causal={is_causal}, "
+            f"batch={actual_batch}, max_qlen={max_qlen}, "
+            f"max_kvlen={actual_max_kvlen})"
+        )
+        assert buffers["reduce_indptr"].numel() >= a_reduce_indptr_size, (
+            f"reduce_indptr alloc={buffers['reduce_indptr'].numel()} < "
+            f"need={a_reduce_indptr_size} (kind={kind}, causal={is_causal}, "
+            f"batch={actual_batch}, max_qlen={max_qlen}, "
+            f"max_kvlen={actual_max_kvlen})"
+        )
+        assert buffers["reduce_final_map"].shape[0] >= a_reduce_final_map_size[0], (
+            f"reduce_final_map rows alloc={buffers['reduce_final_map'].shape[0]} "
+            f"< need={a_reduce_final_map_size[0]} (kind={kind}, "
+            f"causal={is_causal}, batch={actual_batch}, max_qlen={max_qlen}, "
+            f"max_kvlen={actual_max_kvlen})"
+        )
+        assert buffers["reduce_partial_map"].numel() >= a_reduce_partial_map_size, (
+            f"reduce_partial_map alloc={buffers['reduce_partial_map'].numel()} "
+            f"< need={a_reduce_partial_map_size} (kind={kind}, "
+            f"causal={is_causal}, batch={actual_batch}, max_qlen={max_qlen}, "
+            f"max_kvlen={actual_max_kvlen})"
+        )
+
         self._get_ps_metadata_v1(
             qo_indptr_cpu,
             kv_indptr_cpu,
