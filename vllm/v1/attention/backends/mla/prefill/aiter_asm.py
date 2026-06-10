@@ -175,6 +175,7 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         self._ps_max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        self._max_model_len = vllm_config.model_config.max_model_len
         # Persistent buffers are looked up from the class-level _SHARED_BUFFERS
         # cache the first time prepare_metadata / run_prefill_context_chunk
         # runs (when we have a device). Two separate buffer sets exist per
@@ -213,13 +214,25 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
             attn_lse:  (num_partial_tiles * tile_q, num_heads)             f32
             final_lse: (total_q, num_heads)                                f32
 
-        ``num_partial_tiles`` at runtime is ``reduce_indptr[-1]``, bounded by
-        the PS metadata capacity ``reduce_partial_map_size``; ``total_q`` is
-        the summed new-tokens Q over the batch, bounded by
-        ``max_num_batched_tokens``. The worst case is taken across both chunk
-        kinds (new-tokens and context) since each sizes its PS metadata
-        independently. Reserving here, before ``lock_workspace()``, grows the
-        workspace to the max so no post-lock growth is needed.
+        ``num_partial_tiles`` at runtime is ``reduce_indptr[-1]`` for the chunk
+        being processed.  ``total_q`` is the summed new-tokens Q over the batch,
+        bounded by ``max_num_batched_tokens``.
+
+        We must NOT bound ``num_partial_tiles`` by ``reduce_partial_map.numel()``
+        from ``_ensure_persistent_buffers``: that is the *metadata buffer
+        capacity*, which AITER sizes for the context kind with the worst-case
+        product of ``batch=max_num_seqs`` AND ``max_kvlen=`` the full
+        chunked-prefill workspace simultaneously — a batch×workspace cross
+        product that can never occur (total context is bounded by the workspace,
+        not by batch times the workspace).  Using it to size the f32 ``logits``
+        scratch over-reserves by orders of magnitude (hundreds of GiB → OOM).
+
+        The actual runtime ceiling on ``num_partial_tiles`` is the single
+        request case (``batch=1``): concentrating all of one batch's query and
+        context into one sequence maximizes its partial-tile count; spreading
+        the same totals across more requests only lowers it.  So we recompute
+        the metadata info with ``batch=1`` at the largest per-request Q/KV
+        lengths, separately for each chunk kind, and take the max.
         """
         if not torch.accelerator.is_available():
             return
@@ -231,19 +244,32 @@ class AiterAsmPrefillBackend(MLAPrefillBackend):
         if not is_workspace_manager_initialized():
             return
 
-        device = torch.accelerator.current_accelerator()
-        assert device is not None
-
         nhead = self.num_heads
         v_head_dim = self.v_head_dim
         tile_q = _FP8_PREFILL_TILE_Q
 
+        # New-tokens chunk (causal): a single request's Q is bounded by both
+        # max_model_len and the per-batch token budget.
+        new_tokens_qlen = min(self._max_model_len, self._ps_max_num_batched_tokens)
+        # Context chunk (noncausal): a single request's Q is bounded as above;
+        # its per-chunk KV is bounded by the chunked-prefill workspace size.
+        context_qlen = new_tokens_qlen
+        context_kvlen = self._ps_max_context_kvlen
+
         max_partial_tiles = 0
-        for kind in ("new_tokens", "context"):
-            buffers = self._ensure_persistent_buffers(device, kind)
-            max_partial_tiles = max(
-                max_partial_tiles, buffers["reduce_partial_map"].numel()
+        for max_qlen, max_kvlen in (
+            (new_tokens_qlen, None),
+            (context_qlen, context_kvlen),
+        ):
+            (*_, (reduce_partial_map_size, _)) = self._get_ps_metadata_info_v1(
+                batch_size=1,
+                num_head_k=nhead,
+                max_qlen=max_qlen,
+                qlen_granularity=tile_q,
+                max_kvlen=max_kvlen,
+                kvlen_granularity=_KVLEN_GRANULARITY,
             )
+            max_partial_tiles = max(max_partial_tiles, reduce_partial_map_size)
 
         max_total_q = self._ps_max_num_batched_tokens
         current_workspace_manager().get_simultaneous(
