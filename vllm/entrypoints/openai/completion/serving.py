@@ -149,8 +149,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        # Extract data_parallel_rank from header (router can inject it)
-        data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        # Prefer the request body field, falling back to the header
+        # (a router can inject either to pin the request to a DP rank).
+        data_parallel_rank = (
+            request.data_parallel_rank
+            if request.data_parallel_rank is not None
+            else self._get_data_parallel_rank(raw_request)
+        )
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len

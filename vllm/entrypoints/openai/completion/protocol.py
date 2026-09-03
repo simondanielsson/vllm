@@ -155,6 +155,14 @@ class CompletionRequest(OpenAIBaseModel):
             "multiple requests in the same conversation or agent session."
         ),
     )
+    data_parallel_rank: int | None = Field(
+        default=None,
+        description=(
+            "The data parallel rank to route this request to. Takes "
+            "precedence over the X-data-parallel-rank header. Used by "
+            "external routers to pin a request to a specific DP rank."
+        ),
+    )
 
     return_tokens_as_token_ids: bool | None = Field(
         default=None,
