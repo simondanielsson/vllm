@@ -23,6 +23,12 @@ from tests.kernels.moe.utils import make_dummy_moe_config  # noqa: E402
 from vllm.model_executor.layers.fused_moe.activation import (  # noqa: E402
     MoEActivation,
 )
+from vllm.model_executor.layers.fused_moe.config import (  # noqa: E402
+    RoutingMethodType,
+)
+from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp8_a8w8_moe import (  # noqa: E402
+    AiterMxfp8A8W8ExpertsMonolithic,
+)
 from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp8_moe import (  # noqa: E402
     _AITER_SWIGLU_ALPHA,
     _AITER_SWIGLU_BETA,
@@ -52,6 +58,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (  # noqa:
 from vllm._aiter_ops import rocm_aiter_ops  # noqa: E402  # isort: skip
 
 _AITER_MOD = "vllm.model_executor.layers.fused_moe.experts.aiter_mxfp8_moe"
+_A8W8_MOD = "vllm.model_executor.layers.fused_moe.experts.aiter_mxfp8_a8w8_moe"
 
 
 def _config(ep_size: int = 1):
@@ -174,3 +181,49 @@ def test_gfx942_picks_emulation():
         backend, experts_cls = select_mxfp8_moe_backend(_config())
     assert backend is Fp8MoeBackend.EMULATION
     assert experts_cls is Mxfp8EmulationTritonExperts
+
+
+def _a8w8_config(dp_size: int, tp_size: int):
+    """MiniMax-M3 MoE shapes under DP ``dp_size`` x TP ``tp_size`` without EP.
+
+    Mirrors what ``FusedMoEParallelConfig.make`` produces in that deployment:
+    TP is flattened across DP (tp_size = dp_size * tp_size) while dp_size stays
+    as-is and EP is off.
+    """
+    cfg = make_dummy_moe_config(
+        num_experts=128,
+        experts_per_token=4,
+        hidden_dim=6144,
+        intermediate_size=3072 // (dp_size * tp_size),
+    )
+    return dataclasses.replace(
+        cfg,
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=dataclasses.replace(
+            cfg.moe_parallel_config,
+            tp_size=dp_size * tp_size,
+            dp_size=dp_size,
+        ),
+    )
+
+
+@pytest.mark.parametrize("dp_size,tp_size", [(1, 8), (2, 4)])
+def test_gfx942_dp_no_ep_keeps_weights_mxfp8(dp_size, tp_size):
+    """Attention-DP without EP must still reach the a8w8 kernel on gfx942.
+
+    Falling back to EMULATION here would dequantize every expert weight to BF16
+    at load and roughly double MoE weight memory, so assert on the backend the
+    oracle picks rather than on the gate itself.
+    """
+    with (
+        patch.multiple(
+            f"{_A8W8_MOD}.current_platform",
+            is_rocm=lambda: True,
+            supports_mx=lambda: False,
+        ),
+        patch("vllm.platforms.rocm.on_gfx942", return_value=True),
+        patch.object(rocm_aiter_ops, "is_enabled", return_value=True),
+    ):
+        backend, experts_cls = select_mxfp8_moe_backend(_a8w8_config(dp_size, tp_size))
+    assert backend is Fp8MoeBackend.AITER_MXFP8_A8W8
+    assert experts_cls is AiterMxfp8A8W8ExpertsMonolithic

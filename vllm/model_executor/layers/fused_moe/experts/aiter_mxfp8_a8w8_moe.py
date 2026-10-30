@@ -142,11 +142,7 @@ class AiterMxfp8A8W8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return (
-            not moe_parallel_config.use_ep
-            and not moe_parallel_config.enable_eplb
-            and moe_parallel_config.dp_size <= 1
-        )
+        return not moe_parallel_config.use_ep and not moe_parallel_config.enable_eplb
 
     @staticmethod
     def _supports_routing_method(
